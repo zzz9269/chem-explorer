@@ -1192,6 +1192,15 @@ def openfda_label(generic_name: str = "", brand_name: str = "",
                                    or [*(res.get("abuse") or []), *(res.get("dependence") or [])]),
         "controlled_substance": _clean_label_text(res.get("controlled_substance")),
         "when_using": _clean_label_text(res.get("when_using")),
+        # plain-language patient text: the Medication Guide is written as patient
+        # questions ('How should I take…?', 'What should I avoid…?'); counseling
+        # covers missed doses, driving, alcohol; inactive ingredients answer
+        # lactose/gelatin questions. Kept raw (not cleaned) so headings survive.
+        "medguide": " ".join(res.get("spl_medguide") or res.get("spl_patient_package_insert")
+                             or res.get("patient_medication_information") or [])[:30000],
+        "patient_info": _clean_label_text(res.get("information_for_patients")),
+        "inactive_ingredients": " ".join(res.get("inactive_ingredients")
+                                         or res.get("inactive_ingredient") or [])[:3000],
         "spl_set_id": spl_set,
         "url": (f"https://dailymed.nlm.nih.gov/dailymed/drugInfo.cfm?setid={spl_set}"
                 if spl_set else ""),

@@ -9,6 +9,17 @@ from the sources below by rule-based code, so nothing is invented.
 
 > For information only — not medical advice.
 
+## How Ask understands questions
+
+`question_bank.json` is a catalogue of ~80 question types (yes/no, how long,
+how much, why, which…) with ~700 example phrasings. The parser uses keyword
+rules first; phrasings the rules miss are matched to the nearest question type
+by vocabulary similarity — **add a phrasing to the JSON to teach the app it**, no
+code change. Each type also states what a good answer must contain, and answers
+open with a "Short answer" chosen by the question's form (a verdict for yes/no,
+a duration for "how long", a dose for "how much"), always quoted from a source
+or computed from the structure.
+
 ## Run locally
 
 ```bash

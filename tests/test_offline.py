@@ -6,6 +6,8 @@ comparison table, brand registers and the Ask parser. No network needed.
 Each regression test names the real bug it pins down, so a failure says what
 came back.
 """
+import re
+
 import pytest
 
 import chem_sources as cs
@@ -397,6 +399,50 @@ class TestHsaRegister:
     def test_market_route_only_applies_in_singapore(self):
         assert v.market_route("SG", "Diclofenac sodium") == "ORAL"   # salt stripped
         assert v.market_route("US", "diclofenac") == ""
+
+
+# ------------------------------------------------ relationship questions
+@pytest.mark.skipif(not v.HAS_CHAT, reason="chat_router missing")
+@pytest.mark.parametrize("q,subject,target", [
+    # REGRESSION 2026-10-11: answered with glucagon's OWN overdose section
+    ("why is glucagon the antidote for beta blocker overdose", "Glucagon", "beta blocker overdose"),
+    ("how does naloxone reverse morphine overdose", "Naloxone", "morphine overdose"),
+    ("why is atropine given for organophosphate poisoning", "Atropine", "organophosphate poisoning"),
+    ("why does metformin cause weight loss", "Metformin", "weight loss"),
+])
+def test_relation_questions_are_recognised(q, subject, target):
+    p = v.cr.parse_query(q)
+    assert p["mode"] == "relation"
+    assert p["entities"][0]["display"] == subject and p["relation_target"] == target
+
+
+@pytest.mark.skipif(not v.HAS_CHAT, reason="chat_router missing")
+@pytest.mark.parametrize("q", ["does metformin cause weight gain?", "how does metformin work",
+                               "why is warfarin dangerous", "metoprolol vs propranolol",
+                               "can I take ibuprofen with warfarin"])
+def test_ordinary_questions_are_not_relations(q):
+    assert v.cr.parse_query(q)["mode"] != "relation"
+
+
+def test_relation_target_pattern_is_tolerant():
+    rx = v.relation_target_re("beta blocker overdose")
+    for s in ("beta blockers", "beta-blocker", "β-blocker", "beta-adrenergic blocker"):
+        assert rx.search(s), s
+    assert v.relation_core("beta blocker overdose") == "beta blocker"
+
+
+def test_explaining_sentence_outranks_interaction_warning():
+    rx = v.relation_target_re("beta blocker overdose")
+    subj = re.compile(r"\bglucagon\b", re.I)
+    q = "why is glucagon the antidote for beta blocker overdose"
+    explain = ("Glucagon in beta blocker overdose increases cAMP in the myocardium, in effect "
+               "bypassing the β-adrenergic second messenger system.")
+    warning = ("Patients taking beta-blockers may have a transient increase in pulse and blood "
+               "pressure when given glucagon.")
+    unrelated = "Glucagon raises blood sugar."
+    assert v.score_relation_sentence(explain, subj, rx, q) > \
+        v.score_relation_sentence(warning, subj, rx, q)
+    assert v.score_relation_sentence(unrelated, subj, rx, q) == 0
 
 
 # --------------------------------------------------------------- Ask parser

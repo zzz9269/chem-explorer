@@ -51,6 +51,11 @@ try:
 except Exception:  # noqa: BLE001
     Chem = None
 
+try:
+    import question_bank as _qb      # question-type catalogue (data + form rules)
+except Exception:  # noqa: BLE001 — the router still works without it
+    _qb = None
+
 MAX_QUERY_LEN = 500
 
 # ---------------------------------------------------------------------------
@@ -198,6 +203,49 @@ storage stored store expire expiry expired fridge temperature
 spectrum spectra legal illegal controlled addictive addiction abuse
 """.split())
 
+# Side-effect, ingredient and everyday-question words: never a drug name and
+# never typo-corrected into one ('lactose' must not become the enzyme lactase,
+# 'drowsiness' must not be looked up as a chemical).
+COMMON_WORDS = COMMON_WORDS | frozenset("""
+drowsiness sleepiness somnolence fatigue tiredness dizziness lightheadedness sweating
+sweats tremor tremors shaking palpitations bloating gas flatulence cramping bruising
+hallucinations confusion agitation restlessness irritability nightmares sedation
+impotence tinnitus jaundice hypoglycemia hypoglycaemia hypotension hypertension
+tachycardia bradycardia edema oedema numbness tingling weakness thirst dehydration
+blurred vision photosensitivity sunburn indigestion dyspepsia hiccups yawning
+nosebleeds bleeds suicidal thoughts libido dependence dependency tolerance
+lactose gelatin gelatine gluten halal kosher vegan vegetarian excipient excipients
+filler fillers dye dyes preservative preservatives inactive ingredient ingredients
+peanut soy dairy pork porcine bovine animal
+differ differs anymore thinking suddenly abruptly taper tapering turkey wean
+trimester trimesters sperm infertility machinery machines driving drove
+subsidised subsidized subsidy expensive costly cheaper cheapest price prices
+crush crushed crushing split splitting chew chewing swallow dissolve dissolving
+capsule capsules sachet sachets half halves twice thrice
+missed miss skip skipped forgot forget forgotten double
+bedtime meals empty stomach
+stronger strongest weaker weakest safer safest milder mildest harsher gentler faster
+slower quicker longer shorter cheaper effective potent
+toothache backache earache stomachache bellyache tummy menstrual cramps migraines
+sinusitis hayfever tonsillitis bronchitis pneumonia gastritis heartburn arthritis
+hay remedy remedies cure cures treatment treatments therapy therapies solution solutions
+pens pen inhaler inhalers patch patches spray sprays drop drops
+faeces feces stool stools bile react reacts reaction interfere interferes interfering
+synthetic natural organic compared comparing hooked percentage tips advice regularly
+uti utis runny blocked stuffy watery itchy die dying dead alive spinach greens vegetables
+""".split())
+
+
+def _is_common(w: str) -> bool:
+    """A common English word, also in its plural ('headaches', 'remedies')."""
+    if w in COMMON_WORDS:
+        return True
+    if w.endswith("ies") and w[:-3] + "y" in COMMON_WORDS:
+        return True
+    if w.endswith("es") and w[:-2] in COMMON_WORDS:
+        return True
+    return w.endswith("s") and w[:-1] in COMMON_WORDS
+
 # Single-word Singapore brand names that are also everyday words or class
 # names — never matched as brands.
 _BRAND_EXCLUDE = frozenset("""
@@ -315,7 +363,7 @@ LAY_SYNONYMS: Dict[str, Tuple[str, ...]] = {
 # Intents
 # ---------------------------------------------------------------------------
 # A "how does X <verb>" question asks how the drug works.
-_HOW_MECH = (r"\bhow (?:does|do|did|can|could|would|will|is|are)\b"
+_HOW_MECH = (r"\bhow (?:exactly |actually |precisely )?(?:does|do|did|can|could|would|will|is|are)\b"
              r"(?! (?:long|much|many|often|fast|quickly|soon|safe|bad|common|likely|"
              r"strong|effective|well|big|old)\b)[^?.!]{0,80}?\b"
              r"(?:work|works|working|act|acts|stop|stops|help|helps|relieve|relieves|"
@@ -332,8 +380,12 @@ _INTENT_SPECS: List[Tuple[str, str, str]] = [
     ("mechanism",
      _HOW_MECH + r"|\b(?:mechanisms?(?: of action)?|moa|modes? of action|pharmacodynamics?|"
      r"pharmacology|pharmacological (?:action|effects?)|how (?:it|drugx|they) works?|"
-     r"what does (?:it|drugx) do|what (?:it|drugx) does|molecular targets?|targets?|"
-     r"receptors?|binds?|binding|agonis[tm]s?|antagonis[tm]s?|inhibits?|inhibition|"
+     r"what does (?:it|drugx) (?:actually |really |exactly )?do\b(?! to)|what (?:it|drugx) does|"
+     r"molecular targets?|targets?|"
+     r"receptors?|binds?|binding|agonis[tm]s?|antagonis[tm]s?|inhibits?|inhibition|inhibitors?|"
+     r"blocks?|blockers?|what (?:enzyme|receptor|target|protein|channel)s? (?:does|do) (?:it|drugx) "
+     r"(?:inhibit|block|target|bind|act|affect)\w*|"
+     r"(?:have|has|exerts?|produces?) its effects?|"
      r"acts? (?:on|as|at)|works? on|site of action)\b",
      r"\bhow (?:does|do|can|would|will) (?:it|drugx) (?:affect|make|change|do)\b|"
      r"\bwhat does (?:it|drugx) do to\b"),
@@ -342,11 +394,26 @@ _INTENT_SPECS: List[Tuple[str, str, str]] = [
      r"eliminated|excret\w*|clearance|cleared|metaboli[sz]\w*|metabolites?|broken down|"
      r"break(?:s|ing)? (?:it |drugx )?down|cyp ?\d\w*|cytochrome|absorb\w*|absorption|"
      r"bioavailab\w*|onset|kicks? in|takes? effect|peak (?:levels?|concentrations?|plasma|"
-     r"effect)|protein[- ]bind\w*|protein[- ]bound|volume of distribution|distribut\w*|"
+     r"effect)|time to peak|(?:does|do|will) (?:it|drugx) peak|peaks?|prodrugs?|"
+     r"protein[- ]bind\w*|protein[- ]bound|volume of distribution|distribut\w*|"
      r"blood[- ]brain barrier|cross(?:es)? the (?:blood|placenta)|duration of action|"
-     r"how long (?!should|(?:do|can|must|may) (?:i|you) (?:take|use|keep))"
+     r"how long (?!should|(?:do|can|must|may|should) (?:i|you) (?:need to |have to )?"
+     r"(?:take|use|keep|stay|be on|continue)|(?:is|does) (?:a |the )?(?:course|treatment))"
      r"(?:does|do|will|is|can|until|before|for|it)[^?.!]{0,60}|"
+     r"(?:body|liver|kidneys?) (?:process\w*|handle\w*|metaboli\w*|breaks? (?:\w+ )?down|"
+     r"do(?:es)? (?:to|with))|process(?:es|ed)? (?:it|drugx)|get(?:s)? rid of|"
+     r"removed? from (?:the|my|your) (?:body|system)|clear(?:s|ed)? (?:from|out of)|"
+     r"(?:go|goes|travel\w*|move\w*) (?:in|through|around) (?:the|my|your) body|"
+     r"get(?:s)? into (?:the )?(?:brain|blood|bloodstream|tissues?|cells?)|"
+     r"reach(?:es)? the brain|happens? (?:to (?:it|drugx) )?in (?:the|my|your) body|"
+     r"in the body after|body do with|urine tests?|false positives?|"
+     r"show (?:up )?(?:on|in) (?:a )?(?:drug|urine|blood) tests?|fail (?:a )?(?:drug|urine) tests?|"
+     r"feel the effects?|notice (?:the )?(?:effects?|a difference)|"
+     r"before (?:it|drugx) (?:works?|starts? working|kicks? in|takes? effect)|"
      r"stays? in (?:my|your|the) (?:system|body|blood|urine)|drug tests?|"
+     r"(?:start(?:s|ing)?|begins?|beginning) (?:to )?work\w*|takes? to work|wears? off|"
+     r"leaves? (?:the|my|your) (?:body|system)|out of (?:my|your|the) (?:system|body)|"
+     r"through (?:the )?urine|in (?:the )?urine|"
      r"how (?:fast|quickly|soon) (?:does|do|will|can|is|until))\b",
      ""),
     ("uses",
@@ -355,65 +422,158 @@ _INTENT_SPECS: List[Tuple[str, str, str]] = [
      r"helps? (?:with|for)|purpose|why (?:do|would|is|are|did)[^?.!]{0,40}"
      r"(?:take|prescribe\w*|use|given)|(?:can|does|will|is|could) (?:it|drugx)[^?.!]{0,20}"
      r"\b(?:treat|cure|help)|to treat|treats|treatment (?:of|for)|therapeutic|"
-     r"approved (?:for|to)|what conditions?)\b",
+     r"approved (?:for|to)|what conditions?|what'?s (?:it|drugx) (?:for|used for|good for)|"
+     r"when (?:is|are) (?:it|drugx|they) (?:used|prescribed|given)|works? for|"
+     r"effective (?:for|against|in treating)|"
+     r"(?:take|use) (?:it|drugx) for (?!\d|a (?:week|month|day)|long|how long|more than|over|years|"
+     r"months|weeks|days))\b",
      ""),
     ("dosing",
-     r"\b(?:dos(?:e|es|age|ages|ing)|how (?:much|many)|how often|how (?:do|should|can|must|"
+     r"\b(?:dos(?:e|es|age|ages|ing)|"
+     # 'how much/many' — but not 'how much of it is protein bound', 'how many
+     # people…', 'how many stereocentres', 'how much does it cost'
+     r"how (?:much|many)(?! (?:of )?(?:drugx|it) (?:is|are|gets?) (?:protein|bound|absorbed|"
+     r"excreted|metaboli\w*|eliminated|cleared)| people| patients| users| stereo\w*| chiral\w*"
+     r"| atoms?| rings?| carbons?| bonds?| hydrogens?| times| hours| days| weeks| years|"
+     r" (?:does|do|is|are|would|will) (?:it|drugx|they)(?: (?:cost|be|in|at))?\b|"
+     r" (?:is|are|does|do) (?:a |one |the )?(?:box|pack|packet|bottle|strip|course|tube)s?\b|"
+     r" (?:of )?(?:drugx|it) (?:is|would be|can be|could be) (?:dangerous|toxic|lethal|fatal|deadly))|"
+     r"max(?:imum)? (?:daily )?(?:dose|amount|intake)|"
+     r"how often|how frequently|how (?:do|should|can|must|"
      r"would) (?:i|you|we|one) (?:take|use|give|apply|administer)|how long should|"
      r"how long (?:do|can|must|may) (?:i|you) (?:take|use|keep)|maximum (?:daily )?"
      r"(?:dose|amount)|max(?:imum)? (?:per|a) day|per day|times (?:a|per) day|"
+     r"max(?:imum)?\b[^?.!]{0,30}\b(?:a|per|in a|each|every) (?:day|24 hours)|in 24 hours|"
+     r"most (?:drugx )?(?:i|you|one) (?:can|could|should) take|max (?:i|you) can take|"
+     r"(?:once|twice|three times|four times) (?:a|per) day|every \d+(?: ?(?:to|-) ?\d+)? hours|"
+     r"hours apart|"
      r"directions|administ\w*|regimen|strengths?|dosage forms?|formulations?|"
-     r"mg|mcg|milligrams?|missed (?:a )?dose|when (?:to|should i) take)\b",
+     r"what forms?|forms? (?:is|does|of)|come (?:as|in) (?:a |an )?\w+|syrups?|liquid form|"
+     r"mg|mcg|milligrams?|miss(?:ed|ing)? (?:a |my |one |the )?(?:dose|pill|tablet)s?|"
+     r"skip(?:ped|ping)? (?:a |my )?(?:dose|pill|tablet)|forg[eo]t(?:ten)? (?:to take )?|"
+     r"double up|when (?:to|should i) take|"
+     r"crush\w*|split\w*|cut (?:it |them |drugx )?in half|chew\w*|swallow(?:ed)? (?:it |them )?whole|"
+     r"open (?:the |drugx )?capsules?|break (?:the |it )?(?:tablets?|pills?)|"
+     r"how (?:should|must|is|are|can|do) (?:i |you |it |drugx )?(?:be )?taken|how to take|"
+     r"empty stomach|with or without (?:food|meals?)|before or after (?:food|meals?|eating)|"
+     r"(?:before|after) (?:meals?|food|eating|breakfast|bed)|food affect\w*|"
+     r"morning or (?:at )?night|(?:in the )?morning|at night|bedtime|time of day|best time|"
+     r"what time (?:should|do|can|must|to|would)\b|long[- ]term|every ?day|daily basis|"
+     r"for \d+ (?:days?|weeks?|months?)|for (?:a|one|two) (?:week|month)s?|"
+     r"(?:course|treatment) (?:length|duration)|how many (?:days|weeks) (?:should|do|must|can|will) (?:i|you)|"
+     r"(?:usual|normal|typical|standard|recommended|right|correct|safe|starting) (?:amount|quantity|dose|"
+     r"dosage)|daily limit|upper limit|limit (?:for|of|per)|highest dose|how regularly|hours between doses|"
+     r"in the (?:evening|afternoon)|eat (?:before|after|with)|without food|with food|after food|before food|"
+     r"tips (?:for|on) (?:taking|using)|advice (?:on|for) (?:taking|using)|"
+     r"(?:best|right|correct|proper) way to take|"
+     r"(?:can|should|may|do) (?:i|you) dissolve (?:it |drugx |them )?in (?:water|juice|milk)|"
+     r"stay on (?:it|drugx)|be on (?:it|drugx)|for (?:years|months|life|a long time|long periods?)|"
+     r"course of|available (?:as|in) (?:an? )?(?:tablets?|capsules?|liquid|syrup|injections?|creams?|"
+     r"patch(?:es)?|inhalers?|sprays?|suppositor\w*|drops|gels?|suspensions?|solutions?)|"
+     r"(?:liquid|chewable|dissolvable|injectable|syrup|topical|cream) (?:version|form|formulation)s?)\b",
      ""),
     ("side_effects",
      r"\b(?:side[- ]?effects?|adverse (?:effects?|reactions?|events?)|adrs?|"
      r"unwanted effects?|reactions?|(?:does|can|will|could|may|might|do) (?:it|drugx|they)"
      r"[^?.!]{0,30}?\bcause|causes?|caused|causing|make (?:me|you|people|someone|us) "
      r"(?:feel )?\w+|makes? (?:me|you) feel|feel (?:sick|sleepy|drowsy|tired|dizzy|weird|"
-     r"funny|bad)|common effects?|bad effects?|long[- ]term effects?)\b",
+     r"funny|bad)|common effects?|bad effects?|long[- ]term effects?|"
+     r"(?:will|would|can|could|does|did|might|may) (?:it|drugx|they) give (?:me|you|people|"
+     r"someone|us)|lead(?:s|ing)? to|result(?:s|ing)? in|brings? on|"
+     r"how (?:common|likely|rare|frequent(?:ly)?) (?:is|are|do|does)|"
+     r"how many (?:people|patients|users) (?:get|experience|have|develop|report)|"
+     r"chances? of (?:getting|having)|incidence of|(?:sex|sexual) drive|libido|"
+     # 'does it raise blood sugar' / 'will I gain weight on it' — an effect
+     # question (the verdict also checks whether it is the INTENDED effect)
+     r"(?:does|do|can|will|could|would|might|may) (?:it|drugx|they) (?:raise|increase|lower|"
+     r"decrease|reduce|elevate|worsen|affect|change|spike|drop|thin|damage|harm)|"
+     r"(?:gain|gaining|put on|putting on|lose|losing) weight|weight (?:gain|loss)|"
+     r"(?:from|caused by|of|on) (?:drugx|it) (?:go away|wear off|last|stop|subside|settle|ease)|"
+     r"(?:what will|how will) (?:it|drugx) (?:do to|make) (?:me|my body|you)|"
+     r"what (?:will )?happens? to (?:me|my body|you) (?:on|if i take|when taking|after taking|while taking)|"
+     r"(?:common|rare|normal|frequent|usual|expected) (?:with|on|from|when taking)|linked to|"
+     r"associated with|percentage of (?:people|patients)|hard on (?:the |my |your )?\w+|"
+     r"(?:hurt|harm|damage|upset|irritate)s? (?:my|your|the) \w+|what to expect|"
+     r"non[- ]?drowsy|non[- ]?sedating|drowsy|sedating|"
+     r"first (?:few )?(?:days|weeks?) (?:on|of|taking)|first (?:few )?(?:days|week))\b",
      ""),
     ("warnings",
      r"\b(?:warnings?|precautions?|boxed warning|black[- ]box|contraindicat\w*|"
      r"who (?:should|shouldn'?t|should not|can'?t|cannot|can not|must not|mustn'?t) "
-     r"(?:take|use|have)|when not to|allerg(?:y|ic) to|avoid (?:if|in|with|when))\b",
+     r"(?:take|use|have)|when not to|(?:should|must) (?:it|drugx) not be|allerg\w*|"
+     r"avoid (?:if|in)|drive|driving|operate (?:heavy )?machinery|machinery|"
+     r"stop(?:ping|ped)? (?:taking |using )?(?:it|drugx|my drugx)|"
+     r"(?:quit|quitting) (?:taking )?(?:it|drugx)|(?:come|coming|get|getting) off|wean\w* off|"
+     r"cold turkey|taper\w*|discontinu\w*|suddenly stop\w*|"
+     r"(?:kidney|renal|liver|hepatic) (?:disease|problems?|failure|impairment|damage|issues?)|"
+     r"not suitable|unsuitable|(?:should|must) avoid (?:it|drugx)|conditions? (?:that )?(?:should )?avoid|"
+     r"know before (?:taking|starting|using)|before (?:taking|starting|using) (?:it|drugx)|"
+     r"bad for (?:my |your |the )?(?:kidneys?|liver|heart|stomach|bones|brain|health)|"
+     r"careful (?:of|about|with)|watch out(?: for)?|look out for|be aware of|"
+     r"(?:ok|okay|safe|fine|alright) (?:with|for people with|if (?:i|you) have) (?:my |a |an )?"
+     r"(?:high blood pressure|hypertension|asthma|diabetes|heart (?:disease|problems?|failure)|kidney|"
+     r"liver|ulcers?|epilepsy|glaucoma|gout|low blood pressure)|"
+     r"before (?:surgery|an operation|a procedure|dental (?:work|treatment)|an? (?:x-?ray|ct scan|mri)|"
+     r"contrast))\b",
      r"\b(?:safe|safely|safety|dangerous|danger|risks?|risky|harmful|bad for|"
      r"is it ok|okay to|can i (?:take|use|have)|should i (?:take|use))\b"),
     ("interactions",
      r"\b(?:interact\w*|together|combin\w*|mix(?:ed|ing)?|at the same time|alongside|"
      r"along with|concomitant\w*|co-?administ\w*|with (?:alcohol|food|grapefruit|milk|"
      r"coffee|caffeine|other (?:drugs|medicines|medications|meds))|"
-     r"(?:drink|drinking) (?:alcohol|beer|wine|coffee)|grapefruit|alcohol|booze)\b",
+     r"(?:drink|drinking) (?:alcohol|beer|wine|coffee)|grapefruit|alcohol|booze|"
+     r"wine|beer|liquor|whisk(?:e)?y|vodka|rum|gin|soju|cocktails?|"
+     r"avoid (?:while|when|with|on)\b|(?:what|things) (?:to|should i|i should) avoid|"
+     r"(?:foods?|drinks?|things|medicines?|medications?|drugs?) (?:to|should i|i should|i must) avoid|"
+     r"not (?:to )?(?:take|be taken|be mixed|mix|combine|be combined|be used|use) with|"
+     r"birth control|the pill|(?:oral )?contraceptives?|contraception|"
+     r"drink (?:on|while|when|with|after|alcohol)|have a drink|drinking (?:on|while|when)|"
+     r"(?:can|should|could) (?:i|you|she|he|they|we) (?:still )?eat\b|eat(?:ing)? (?:\w+ ){0,2}(?:while|on) (?:it|drugx)|"
+     r"react(?:s|ion)? with|interfere(?:s)? with|shouldn'?t (?:i )?(?:take|mix|combine) (?:\w+ )?with|"
+     r"interact with other (?:medicines|medications|drugs))\b",
      ""),
     ("pregnancy",
      r"\b(?:pregnan\w*|breast[- ]?feed\w*|breastfeed\w*|breast[- ]?milk|lactat\w*|"
-     r"nursing (?:mothers?|moms?)|while nursing|trying to conceive|conceiv\w*|fertility|"
+     r"nursing (?:mothers?|moms?)|while nursing|when nursing|trying to conceive|conceiv\w*|"
+     r"fertility|infertil\w*|sperm|trimesters?|"
      r"unborn|fetus|foetus|fetal|foetal|teratogen\w*|birth defects?)\b",
      ""),
     ("children",
      r"\b(?:child|children|kids?|pediatric|paediatric|infants?|toddlers?|bab(?:y|ies)|"
      r"newborns?|teen(?:s|agers?)?|adolescents?|under (?:\d+|twelve|six|two)|"
-     r"\d+ ?(?:year|yr)s?[- ]old)\b",
+     r"\d+ ?(?:year|yr|month|mo|week|wk)s?[- ]?old)\b",
      ""),
     ("elderly",
      r"\b(?:elderly|older (?:adults?|people|patients|persons)|geriatric|seniors?|"
      r"old age|over 65|aged (?:6|7|8|9)\d)\b",
      ""),
     ("overdose",
-     r"\b(?:overdos\w*|too much|toxic\w*|poison\w*|ld ?50|lethal|fatal|deadly|"
-     r"kill (?:you|me|someone|a person)|antidote)\b",
+     r"\b(?:overdos\w*|too much|too many|toxic\w*|poison\w*|ld ?50|lethal|fatal|deadly|"
+     r"kill (?:you|me|someone|a person)|antidote|swallowed|ingested|double dose|"
+     r"took (?:\d{2,}|a whole|the whole|all (?:of )?(?:the|my|his|her))|"
+     r"took (?:an? )?(?:extra|additional|double)|accidentally (?:took|swallowed|ingested|gave|had)|"
+     r"how much (?:of )?(?:drugx|it) (?:is|would be|can be|could be) (?:dangerous|toxic|lethal|fatal|deadly)|"
+     r"(?:ate|eaten|got into) (?:some |a |the |my |his |her )?(?:drugx|pills?|tablets?|medicine))\b",
      ""),
     ("brands",
      r"\b(?:brand(?:s|ed| names?)?|trade ?names?|sold (?:as|under)|marketed (?:as|under)|"
      r"generic (?:names?|versions?|equivalents?)|other names?|also (?:known|called) as|"
      r"aka|over[- ]the[- ]counter|otc|prescription[- ]only|need (?:a )?prescription|"
-     r"without (?:a )?prescription|(?:can|where (?:can|do)) (?:i|you) (?:buy|get)|buy|"
+     r"without (?:a )?prescription|"
+     r"(?:can|where (?:can|do)) (?:i|you) (?:buy|get)(?! (?:addicted|hooked|high|dependent|"
+     r"sick|pregnant|used|withdrawal))|buy|"
      r"purchase|availab\w*|in singapore|singapore|hsa|registered|pharmacy[- ]only|"
-     r"in sg|in the us|names? (?:of|for) (?:it|drugx))\b",
+     r"in sg|in the us|names? (?:of|for) (?:it|drugx)|active ingredients?|what drug is|"
+     r"see a (?:doctor|gp) (?:to get|for)|need (?:a |to see a )?(?:doctor|gp)|"
+     r"pharmacist (?:give|sell|recommend)|get (?:it|drugx) (?:from|at) (?:a |the )?(?:pharmacy|chemist|"
+     r"pharmacist))\b",
      ""),
     ("class",
      r"\b(?:drug class|class(?:es)?|classification|classified|what (?:kind|type|sort) of "
      r"(?:drug|medicine|medication|compound|chemical|substance)|type of (?:drug|medicine|"
-     r"medication)|categor(?:y|ies)|family of|group of (?:drugs|medicines)|"
+     r"medication)|categor(?:y|ies)|family of|drug family|group of (?:drugs|medicines)|"
+     r"counts? as an? |considered an? |belong(?:s|ing)? to|(?:what|which) (?:drug )?group|"
+     r"drugx (?:is|are) (?:an? |one of the )|"
      r"is (?:it|drugx) (?:an? )?(?:\w+ ){0,2}(?:opioid|nsaid|steroid|antibiotic|statin|"
      r"ssri|snri|stimulant|depressant|benzodiazepine|benzo|antihistamine|antidepressant|"
      r"narcotic|painkiller|analgesic|antipsychotic|beta[- ]blocker|ace inhibitor|"
@@ -424,7 +584,8 @@ _INTENT_SPECS: List[Tuple[str, str, str]] = [
      r"\b(?:alternatives?|similar (?:drugs?|medicines?|medications?|to)|"
      r"(?:drugs?|medicines?|medications?) (?:like|similar)|instead of|substitutes?|"
      r"replacements?|other (?:drugs|options|medications|medicines|choices)|same class|"
-     r"related drugs)\b",
+     r"related drugs|(?:besides|other than|apart from) (?:it|drugx)|"
+     r"what else (?:can|could|should) (?:i|you|we) (?:take|use|try))\b",
      ""),
     ("identifiers",
      r"\b(?:cas(?: number| no\.?| rn| registry(?: number)?)?|inchi(?:key)?|cid|"
@@ -438,7 +599,7 @@ _INTENT_SPECS: List[Tuple[str, str, str]] = [
      r"molecular (?:structure|formula|shape|model)|chemical (?:formula|structure)|"
      r"formula|3d|3-d|three[- ]dimensional|conformers?|functional groups?|chiral\w*|"
      r"stereo\w*|enantiomers?|isomers?|atoms?|bonds?|rings?|backbone|scaffold|"
-     r"moiet(?:y|ies))\b",
+     r"moiet(?:y|ies)|racemic|racemates?)\b",
      ""),
     ("properties",
      r"\b(?:molecular (?:weight|mass)|mol(?:ecular)?\.? ?wt|mw|molar mass|logp|log ?p|"
@@ -448,7 +609,8 @@ _INTENT_SPECS: List[Tuple[str, str, str]] = [
      r"chemical propert\w*|propert(?:y|ies)|tpsa|polar surface area|drug[- ]?likeness|"
      r"drug[- ]like|lipinski|rule of (?:5|five)|h[- ]?bond (?:donors?|acceptors?)|"
      r"hydrogen bond\w*|appearance|colou?r|odou?r|is it a (?:solid|liquid|gas)|"
-     r"stability|reactiv\w*|flash point|refractive index|charge)\b",
+     r"stability|reactiv\w*|flash point|refractive index|charge|charged|how heavy|weighs?|mass of|"
+     r"basic|alkaline|body ph|physiological ph|fat[- ]soluble|water[- ]soluble)\b",
      ""),
     ("spectra",
      r"\b(?:spectr\w*|nmr|1h nmr|13c|infrared|ir spectrum|mass spec\w*|ms/ms|"
@@ -458,22 +620,43 @@ _INTENT_SPECS: List[Tuple[str, str, str]] = [
      r"\b(?:history|historical|discover\w*|invent\w*|who (?:made|created|developed|found|"
      r"synthesi[sz]ed)|when was (?:it|drugx) (?:made|invented|discovered|approved|"
      r"developed|first)|origins?|developed by|first (?:approved|made|synthesi[sz]ed|used|"
-     r"marketed)|approval date|year (?:of )?approv\w*)\b",
+     r"marketed)|approval date|year (?:of )?approv\w*|(?:when|what year) (?:\w+ ){0,2}(?:come|came) out|"
+     r"introduced|first (?:sold|available))\b",
      ""),
     ("synthesis",
      r"\b(?:synthes[ie]s|synthesi[sz]\w*|how (?:is|are) (?:it|drugx|they) (?:made|produced|"
      r"manufactured|synthesi[sz]ed)|manufactur\w*|production|prepar(?:ed|ation)|"
-     r"biosynthes\w*|made from|derived from|natural source|extracted from)\b",
+     r"biosynthes\w*|made from|derived from|natural source|extracted from|"
+     r"how (?:do|did) (?:they|you|people|companies|manufacturers) make|goes into making|"
+     r"comes? from|natural or synthetic|synthetic or natural|naturally occurring|plant[- ]derived)\b",
      ""),
     ("legal",
      r"\b(?:legal(?:ity| status)?|illegal|controlled(?: substance| drug)?|"
      r"schedule (?:i{1,3}|iv|v|[1-5])|scheduled|banned|addict\w*|abus\w*|dependen\w*|"
-     r"withdrawals?|habit[- ]forming|recreational(?:ly)?|get(?:ting)? high|euphori\w*|"
-     r"street (?:names?|use))\b",
+     r"withdrawals?|habit[- ]forming|recreational(?:ly)?|get(?:ting)? (?:you |me |people )?high|"
+     r"euphori\w*|street (?:names?|use)|hooked|"
+     r"cause(?:s)? (?:physical |psychological )?(?:dependence|addiction|withdrawal))\b",
      ""),
     ("storage",
-     r"\b(?:stor(?:e|ed|age|ing)|shelf[- ]life|expir\w*|refrigerat\w*|fridge|"
-     r"room temperature|out of reach)\b",
+     r"\b(?:stor(?:e|ed|age|ing)|shelf[- ]life|expir\w*|refrigerat\w*|fridge|freezer|"
+     r"room temperature|out of reach|how (?:should|do|can|to|must) (?:i |you |we )?keep|"
+     r"(?:be )?kept (?:in|out|at|cool|cold)|(?:way|where) (?:to|should i|do i|can i) keep|"
+     r"keep (?:it|drugx|them) (?:in|at|out|cool|cold|dry|away)|once opened|after opening|"
+     r"out of date|use[- ]by|best before|past (?:its|the) (?:date|expiry))\b",
+     ""),
+    ("cost",
+     r"\b(?:prices?|costs?|costly|expensive|cheap(?:er|est)?|afford\w*|subsid\w*|medisave|"
+     r"insurance|how much (?:does|do|is|are) (?:it|drugx|they)(?: cost)?(?! (?:protein|bound|"
+     r"absorbed|excreted))\b|how much (?:is|are|does|do) (?:a |one |the )?(?:box|pack|packet|bottle|"
+     r"strip|course|tube)s?\b)",
+     ""),
+    ("ingredients",
+     r"\b(?:(?<!active )ingredients?|inactive ingredients?|excipients?|fillers?|lactose|"
+     r"gelatine?|gluten|halal|kosher|vegan|vegetarian|animal[- ]derived|pork|porcine|bovine|"
+     r"sugar[- ]free|dyes?|colou?rings?|preservatives?|alcohol[- ]free|"
+     r"contains? (?:any )?(?:sugar|alcohol|dairy|soy|peanuts?|nuts?)|"
+     r"what'?s in (?:it|drugx|the|my)|what is in (?:it|drugx)|animal products?|vegetarians?|"
+     r"dairy[- ]free|gluten[- ]free)\b",
      ""),
     ("overview",
      "",
@@ -493,11 +676,15 @@ INTENT_TITLES = {
     "class": "Drug class", "alternatives": "Similar drugs", "identifiers": "Identifiers",
     "structure": "Structure", "properties": "Properties", "spectra": "Spectra",
     "history": "History", "synthesis": "How it's made", "legal": "Abuse & legal status",
-    "storage": "Storage", "search": "From the record",
+    "storage": "Storage", "cost": "Cost", "ingredients": "Ingredients",
+    "search": "From the record",
 }
 
 # Which ADME fact a pharmacokinetics question is about.
 _PK_FACT_RES = [
+    ("Onset", re.compile(r"onset|kicks? in|take\w* (?:effect|to work)|start\w* (?:to )?work|"
+                         r"begin\w* (?:to )?work|how (?:fast|quickly|soon)|feel (?:it|better|the effect)|"
+                         r"until i feel")),
     ("Half-life", re.compile(r"half[- ]?li|how long|\blasts?\b|\bstays?\b|duration|"
                              r"t ?1/2|drug tests?|in (?:my|your) system")),
     ("Metabolism", re.compile(r"metaboli|broken down|break\w* (?:it |drugx )?down|cyp|"
@@ -519,16 +706,49 @@ _FOLLOW_ON_RE = re.compile(r"^(?:and|what about|how about|same (?:for|with)|and 
                            r"what of|now|then)\b")
 _GREETING_RE = re.compile(
     r"^(?:hi|hello|hey|yo|hiya|howdy|good (?:morning|afternoon|evening)|help|"
-    r"what can you do|how do (?:i|you) use (?:this|you|it)|who are you|what are you|"
-    r"start|\?)[\s!.?]*$")
-_THANKS_RE = re.compile(r"^(?:thanks?|thank you|thx|ty|cheers|ok(?:ay)?|great|cool|nice|"
-                        r"awesome|perfect|got it)(?: (?:you|so much|a lot))?[\s!.]*$")
+    r"what can you do|what do you do|how does this work|what is this|how do (?:i|you) use (?:this|you|it)|"
+    r"who are you|what are you|start|\?)(?: there| everyone| all| bot| again| me)?[\s!.?]*$")
+_THANKS_RE = re.compile(r"^(?:(?:thanks?|thank you|thx|ty|cheers|ok(?:ay)?|great|cool|nice|"
+                        r"awesome|perfect|got it|alright|noted|sounds good)(?: (?:you|so much|a lot))?"
+                        r"[\s,!.]*){1,3}$")
+
+# ---- safety routing (checked before anything else) ----
+# First-person self-harm / suicidal intent → crisis support only, never doses.
+_CRISIS_RE = re.compile(
+    r"\b(?:kill(?:ing)? my ?self|end(?:ing)? (?:my|it) (?:life|all)|take my (?:own )?life|"
+    r"suicid\w*|want(?:s|ed)? to die|wanna die|(?:don'?t|do not) want to (?:live|be alive|"
+    r"wake up|exist)|self[- ]?harm\w*|(?:hurt|harm)(?:ing)? my ?self|overdose on purpose|"
+    r"(?:want|going|plan(?:ning)?|trying) to (?:overdose|od)\b|(?:to|would|will|could) kill me\b|"
+    r"(?:i|me|myself) (?:\w+ ){0,6}to die\b|how (?:much|many) [^?.!]{0,50}\b(?:to|and) die\b|"
+    r"\b(?:overdose|od) (?:and|to) die\b|"
+    r"(?:fatal|lethal|deadly) (?:for|to) me\b|enough to (?:kill|end) (?:me|myself|it all)\b|"
+    r"no (?:reason|point) (?:to|in) (?:live|living)|better off dead)")
+# Making / extracting illicit or controlled drugs → declined.
+_ILLICIT_RE = re.compile(
+    r"\b(?:meth|methamphetamine|crystal meth|mdma|ecstasy|molly|lsd|heroin|cocaine|fentanyl|"
+    r"ghb|dmt|amphetamines?|ketamine|pcp|codeine|morphine|oxycodone|opium|psilocybin|"
+    r"mescaline|thc|cannabis oil|krokodil|desomorphine|mephedrone|ephedrine|pseudoephedrine)\b")
+_HOW_TO_MAKE_RE = re.compile(
+    r"\b(?:how (?:to|do i|can i|do you|would i|could i|should i|do people)|ways? to|recipe|"
+    r"steps? (?:to|for)|guide (?:to|for)|instructions? (?:to|for)|tutorial)\b[^?.!]{0,40}"
+    r"\b(?:make|making|cook|cooking|synthesi[sz]e|synthesi[sz]ing|brew|manufacture|produce|"
+    r"extract|extracting|isolate|grow|growing|refine|purify|separate|get (?:\w+ ){0,2}out of|"
+    r"pull (?:\w+ ){0,2}out of)\b|\brecipe for\b|"
+    r"\b(?:home ?made|homemade|diy)\b")
+# Questions about giving/feeding human medicines to animals → out of scope.
+_PET_RE = re.compile(r"\b(?:dogs?|pupp(?:y|ies)|cats?|kittens?|pets?|rabbits?|hamsters?|"
+                     r"guinea pigs?|horses?|parrots?|birds?|ferrets?)\b")
+_PET_CUE_RE = re.compile(r"\b(?:give|giving|gave|ate|eaten|swallowed|licked|chewed|got into|"
+                         r"safe for|for (?:my|our|a|the)|dose for|toxic (?:to|for)|my|our)\b|"
+                         r"\b(?:can|should|could|do|does) (?:my |our |a |the )?(?:dogs?|cats?|pets?|"
+                         r"pupp(?:y|ies)|kittens?|rabbits?) (?:have|take|eat|get|be given)\b")
+_PET_URGENT_RE = re.compile(r"\b(?:ate|eaten|swallowed|licked|chewed|got into|took)\b")
 _LIST_WORDS_RE = re.compile(r"\b(?:what are|list|examples?|which (?:drugs|medicines)|types? of|"
                             r"name (?:some|a few)|all|kinds? of|drugs? (?:in|that are)|"
                             r"members?)\b")
 _CONDITION_TRIGGER_RE = re.compile(
     r"\b(?:for|treat\w*|take|medicine|medicines|medication|medications|meds|drugs?|"
-    r"tablets?|pills?|remed\w*|help|relief|relieve|cure|options?|good)\b")
+    r"tablets?|pills?|remed\w*|help\w*|relief|relieve|cure|options?|good)\b")
 
 _INTERACTANT_RE = re.compile(
     r"\b(?:alcohol|beer|wine|liquor|grapefruit(?: juice)?|food|meals?|milk|dairy|coffee|"
@@ -885,6 +1105,30 @@ def find_condition(text: str) -> Optional[Tuple[str, List[str]]]:
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
+# Chat shorthand → plain English, so the rules and the example matcher see
+# 'does it make you sleepy' for 'does it make u sleepy'. Applied to the raw
+# text before parsing (offsets are taken after this step).
+_SLANG = [
+    # lower-case only: 'U' after a number is units of insulin, 'IM' intramuscular
+    (r"(?<!\d)(?<!\d )\bu\b", "you", 0), (r"\bim\b", "i'm", 0),
+    (r"\bur\b", "your", re.I), (r"\bb4\b", "before", re.I), (r"\bhrs?\b", "hours", re.I),
+    (r"\bmins\b", "minutes", re.I), (r"\bwhats\b", "what is", re.I), (r"\bwats\b", "what is", re.I),
+    (r"\bwot\b", "what", re.I), (r"\bhow's\b", "how is", re.I), (r"\bpls\b|\bplz\b", "please", re.I),
+    (r"\babt\b", "about", re.I), (r"\bw/o\b", "without", re.I), (r"\bw/(?=\s)", "with", re.I),
+    (r"\bcuz\b|\bcoz\b", "because", re.I), (r"\bdont\b", "don't", re.I), (r"\bcant\b", "can't", re.I),
+    (r"\bwont\b", "won't", re.I), (r"\bdoesnt\b", "doesn't", re.I), (r"\bisnt\b", "isn't", re.I),
+    (r"\bive\b", "i've", re.I), (r"\bpreggo\b|\bpreggers\b", "pregnant", re.I),
+    (r"\bmeds\b", "medicines", re.I), (r"\btabs\b", "tablets", re.I),
+]
+_SLANG_RES = [(re.compile(p, fl), r) for p, r, fl in _SLANG]
+
+
+def expand_shorthand(raw: str) -> str:
+    for rx, rep in _SLANG_RES:
+        raw = rx.sub(rep, raw)
+    return raw
+
+
 def _normalize(raw: str) -> str:
     s = (raw.replace("’", "'").replace("‘", "'").replace("“", '"')
          .replace("”", '"').replace("–", "-").replace("—", "-"))
@@ -1000,6 +1244,210 @@ def clip_query(raw: str) -> str:
     return raw[:half] + " … " + raw[-half:]
 
 
+# A relationship question: an explicit link word, or why/how + a verb of use.
+_RELATION_RE = re.compile(
+    r"\bantidotes?\b|\brevers(?:e|es|ed|ing|al)\b|"
+    r"\bwhy\b.{0,80}\b(?:used|given|taken|prescribed|chosen|preferred|first[- ]line|helpful|"
+    r"effective|good|works?|treats?|treating|cause[sd]?|combined|paired|added|together|"
+    r"for|in|against|with)\b|"
+    r"\bhow (?:does|do|can|is|are)\b.{0,80}\b(?:treats?|treating|help\w*|revers\w*|"
+    r"work\w* (?:for|in|on|against)|cause[sd]?)\b", re.I)
+# The thing on the other side of the link: everything after the link word.
+_REL_TARGET_RE = re.compile(
+    r"\b(?:antidotes? (?:for|to|in|against|of)|revers(?:e|es|ed|ing|al of)|"
+    r"treat(?:s|ed|ing|ment of|ment for)?|(?:used|given|prescribed|chosen|preferred) "
+    r"(?:for|in|to treat|against)|"
+    r"(?:given|taken|used|combined|paired|added|mixed|prescribed|administered) "
+    r"(?:together with|alongside|with|to|at|on|before|after|in the)|together with|alongside|"
+    r"(?:give|gives|giving|use|uses|using|administer\w*) (?:\w+ ){0,2}(?:for|in|during|with|to treat)|"
+    r"helps?(?: with| in| for)?|works? (?:for|in|on|against)|"
+    r"effective (?:for|in|against)|good for|cause[sd]?|for|against)\s+(?P<target>.+)$", re.I)
+
+
+def relation_target(raw: str, entities: List[Dict]) -> str:
+    """'beta blocker overdose' for 'why is glucagon the antidote for beta blocker
+    overdose?' — the other side of a drug↔X relationship question, or '' when
+    the question isn't one. The first entity is the subject; its own name is
+    removed from the target."""
+    if not entities or not _RELATION_RE.search(raw):
+        return ""
+    m = _REL_TARGET_RE.search(raw)
+    if not m:
+        return ""
+    target = m.group("target")
+    subj = entities[0].get("text") or entities[0].get("display") or ""
+    if subj:
+        target = re.sub(re.escape(subj), " ", target, flags=re.I)
+    target = re.sub(r"\s+", " ", target).strip(" ?!.,;:\"'")
+    target = re.sub(r"^(?:a|an|the|patients? with|people with|someone with)\s+", "", target, flags=re.I)
+    words = {w.lower() for w in re.findall(r"[a-z]+", target, re.I)}
+    # 'how does it work in the brain' is a mechanism question
+    if words and words <= _REL_BODY_WORDS:
+        return ""
+    # 'what's the antidote for <drug> overdose' is about the drug's OWN
+    # overdose — but 'why give naloxone in an overdose' links two things
+    own = subj and re.search(rf"\b{re.escape(subj)}\W+(?:overdose|overdosage|poisoning|toxicity)\b",
+                             raw, re.I)
+    if words and words <= _REL_BODY_WORDS | _REL_GENERIC_TARGETS and (
+            own or not re.search(r"\b(?:why|how)\b", raw, re.I)):
+        return ""
+    return target if re.search(r"[a-z]{3}", target, re.I) else ""
+
+
+# Words that never make a relationship target on their own.
+_REL_BODY_WORDS = frozenset("""
+the a an my your his her its their body brain heart liver kidney kidneys stomach gut blood
+cells cell nerves nervous system cns muscles lungs skin bones human humans people person
+""".split())
+_REL_GENERIC_TARGETS = frozenset("overdose overdoses overdosage poisoning toxicity intoxication".split())
+
+
+# 'does it raise/lower/affect …' (an effect question unless another topic is named)
+_EFFECT_VERB_RE = re.compile(
+    r"\b(?:does|do|can|will|could|would|might|may) (?:it|drugx|they) (?:raise|increase|lower|"
+    r"decrease|reduce|elevate|worsen|affect|change|spike|drop|thin|damage|harm)\b")
+
+# ---- allergies ----
+_ALLERGY_RE = re.compile(r"\ballerg\w*")
+# the allergen when it isn't a recognised drug: 'allergic to sulfa', 'nuts'
+_ALLERGEN_WORD_RE = re.compile(
+    r"\ballergic to (?:a |an |the )?([a-z][a-z\- ]{1,30}?)(?=\s+(?:and|but|so|can|could|is|will|"
+    r"should|would|do|does|what|which)\b|[,.?!]|$)")
+
+
+def _split_allergen(t: str, entities: List[Dict]) -> Optional[Dict]:
+    """The entity that is the ALLERGEN in 'allergic to penicillin, can I take
+    amoxicillin' / 'is amoxicillin safe with a penicillin allergy' — only when
+    another drug is being asked about."""
+    if len(entities) < 2:
+        return None
+    for en in entities:
+        s, e = en["span"]
+        before, after = t[max(0, s - 30):s], t[e:e + 14]
+        if re.search(r"(?:allerg\w*|reactions?|sensitiv\w*|intoleran\w*) (?:to|with|from) (?:a |an )?$",
+                     before) or re.match(r"\s*(?:allerg\w*|sensitivity|intolerance)", after):
+            return en
+    return None
+
+
+# ---- nearest example in the question bank ----
+USE_TEMPLATE_MATCHER = True
+MATCH_STRONG = 0.86     # ≈ the same phrasing as a bank example: the bank decides
+MATCH_WEAK = 0.55       # similar phrasing: used only when the rules found nothing
+_MATCH_DROP = frozenset("a an the please some any".split())
+
+
+def _match_features(text: str) -> List[str]:
+    """Stemmed words + adjacent word pairs, articles dropped — question words
+    ('how long', 'can i') are kept: they carry the type."""
+    t = re.sub(r"\{(?:drug|drug2|brand)\}", " drugx ", text.lower())
+    t = re.sub(r"\{\w+\}", " ", t)
+    words = [stem(w) for w in _TOKEN_RE.findall(t) if w not in _MATCH_DROP]
+    return words + [f"{a}_{b}" for a, b in zip(words, words[1:])]
+
+
+@lru_cache(maxsize=1)
+def _template_index():
+    """[(type, example, {feature: weight}, norm)] with IDF weights over all
+    bank examples."""
+    if _qb is None:
+        return [], {}
+    rows = [(qt, ex, set(_match_features(ex))) for qt in _qb.types() for ex in _qb.examples(qt)]
+    n = len(rows) or 1
+    df: Dict[str, int] = {}
+    for _qt, _ex, feats in rows:
+        for f in feats:
+            df[f] = df.get(f, 0) + 1
+    idf = {f: math.log((n + 1) / (c + 1)) + 1.0 for f, c in df.items()}
+    index = []
+    for qt, ex, feats in rows:
+        vec = {f: idf[f] for f in feats}
+        norm = math.sqrt(sum(v * v for v in vec.values())) or 1.0
+        index.append((qt, ex, vec, norm))
+    return index, idf
+
+
+# Vocabulary match thresholds, set on held-out batch 1 (alone, the matcher
+# picked the right topic for 92% of questions; at these settings it covers
+# ~85% of them at ~98% accuracy) — and only used when the rules found nothing.
+TYPE_MIN = 0.25         # minimum similarity to a question type…
+TYPE_MARGIN = 0.04      # …and its lead over the best type with a different topic
+
+
+@lru_cache(maxsize=1)
+def _type_index():
+    """One weighted vocabulary per answerable question type — all its examples
+    pooled (sublinear term counts × IDF across types) — so a paraphrase is
+    matched to the TYPE's wording, not to a single example sentence."""
+    if _qb is None:
+        return []
+    docs = []
+    for qt in _qb.types():
+        exp = qt.get("expect") or {}
+        if exp.get("mode") != "answer" or not exp.get("topics"):
+            continue
+        counts: Dict[str, int] = {}
+        for ex in _qb.examples(qt):
+            for f in set(_match_features(ex)):
+                counts[f] = counts.get(f, 0) + 1
+        docs.append((qt, counts))
+    n = len(docs) or 1
+    df: Dict[str, int] = {}
+    for _qt, counts in docs:
+        for f in counts:
+            df[f] = df.get(f, 0) + 1
+    idf = {f: math.log((n + 1) / (c + 1)) + 1.0 for f, c in df.items()}
+    index = []
+    for qt, counts in docs:
+        vec = {f: (1.0 + math.log(c)) * idf[f] for f, c in counts.items()}
+        norm = math.sqrt(sum(v * v for v in vec.values())) or 1.0
+        index.append((qt, vec, norm, idf))
+    return index
+
+
+def type_match(text: str) -> Optional[Tuple[Dict, float, float]]:
+    """(best question type, its similarity, the best similarity among types
+    whose primary topic differs) for a question with drugs replaced by 'drugx'."""
+    index = _type_index()
+    if not index:
+        return None
+    idf = index[0][3]
+    feats = set(_match_features(text)) - {"drugx"}
+    q = {f: idf[f] for f in feats if f in idf}
+    if not q:
+        return None
+    qn = math.sqrt(sum(v * v for v in q.values())) or 1.0
+    scored = []
+    for qt, vec, norm, _idf in index:
+        dot = sum(w * vec[f] for f, w in q.items() if f in vec)
+        scored.append((dot / (qn * norm), qt))
+    scored.sort(key=lambda x: -x[0])
+    best_s, best = scored[0]
+    topic = best["expect"]["topics"][0]
+    rival = next((s for s, qt in scored[1:] if qt["expect"]["topics"][0] != topic), 0.0)
+    return best, best_s, rival
+
+
+def template_match(text: str) -> Optional[Tuple[Dict, float, str]]:
+    """(question type, cosine score, the example it matched) for the bank
+    example nearest to `text` (drug names already replaced by 'drugx')."""
+    index, idf = _template_index()
+    if not index:
+        return None
+    feats = set(_match_features(text))
+    q = {f: idf.get(f, math.log(len(index) + 1) + 1.0) for f in feats}
+    qn = math.sqrt(sum(v * v for v in q.values())) or 1.0
+    best = None
+    for qt, ex, vec, norm in index:
+        dot = sum(w * vec[f] for f, w in q.items() if f in vec)
+        if not dot:
+            continue
+        score = dot / (qn * norm)
+        if best is None or score > best[1]:
+            best = (qt, score, ex)
+    return best
+
+
 def parse_query(raw: str, context: Optional[Dict] = None) -> Dict:
     """Parse one chat message.
 
@@ -1013,20 +1461,33 @@ def parse_query(raw: str, context: Optional[Dict] = None) -> Dict:
       notes      [str] — corrections/assumptions to tell the user
       suggestions [str] — did-you-mean names when nothing matched
     """
-    raw = clip_query(raw)
+    raw = expand_shorthand(clip_query(raw))
     out: Dict = {"raw": raw, "mode": "answer", "entities": [], "weak": [], "intents": [],
                  "focus": [], "notes": [], "suggestions": [], "used_context": False,
                  "class_slugs": [], "class_phrase": "", "condition": None,
-                 "pk_facts": [], "population": [], "interactant": ""}
+                 "pk_facts": [], "population": [], "interactant": "", "form": "",
+                 "same_as": [], "allergen": "", "template": "", "template_score": 0.0}
     if not raw:
         out["mode"] = "empty"
         return out
     t = _normalize(raw)
+    out["form"] = _qb.question_form(t) if _qb else ""
+    # safety first: self-harm wording outranks everything (no doses shown)
+    if _CRISIS_RE.search(t):
+        out["mode"] = "crisis"
+        return out
     if _GREETING_RE.match(t.strip()):
         out["mode"] = "help"
         return out
     if _THANKS_RE.match(t.strip()):
         out["mode"] = "thanks"
+        return out
+    if _HOW_TO_MAKE_RE.search(t) and _ILLICIT_RE.search(t):
+        out["mode"] = "refuse"
+        return out
+    if _PET_RE.search(t) and _PET_CUE_RE.search(t):
+        out["mode"] = "pets"
+        out["urgent"] = bool(_PET_URGENT_RE.search(t))
         return out
 
     # ---- spans that can't be part of a drug name ----
@@ -1085,7 +1546,7 @@ def parse_query(raw: str, context: Optional[Dict] = None) -> Dict:
                 i += 1
                 continue
         ent.update(text=raw[s:e], span=[s, e])
-        if n == 1 and (key in _WEAK_SUBSTANCES or key in COMMON_WORDS):
+        if n == 1 and (key in _WEAK_SUBSTANCES or _is_common(key)):
             weak.append(ent)
         else:
             entities.append(ent)
@@ -1097,7 +1558,7 @@ def parse_query(raw: str, context: Optional[Dict] = None) -> Dict:
     for idx, (w, s, e) in enumerate(toks):
         if used[idx] or len(w) < 5 or not w.isalpha():
             continue
-        if (w in COMMON_WORDS or w in STOPWORDS or w in FILLER or w in LAY_SYNONYMS
+        if (_is_common(w) or w in STOPWORDS or w in FILLER or w in LAY_SYNONYMS
                 or _is_intent_word(w)):
             continue
         cands = fuzzy_candidates(w)
@@ -1124,13 +1585,22 @@ def parse_query(raw: str, context: Optional[Dict] = None) -> Dict:
 
     entities.sort(key=lambda en: en["span"][0])
     # de-duplicate the same ingredient named twice ('paracetamol (acetaminophen)')
-    seen_q = set()
+    seen_q: Dict[str, Dict] = {}
     uniq = []
     for en in entities:
         q = (en.get("query") or en.get("display") or "").lower()
+        # a combination brand (Augmentin = amoxicillin + clavulanate) is NOT
+        # the same medicine as its first ingredient
+        if en.get("kind") == "brand" and len(en.get("ingredients") or []) > 1:
+            q = "brand:" + (en.get("display") or q).lower()
         if q in seen_q:
+            first = seen_q[q]
+            # 'is paracetamol the same as acetaminophen' — two names, one drug
+            if (en.get("display") or "").lower() != (first.get("display") or "").lower():
+                out["same_as"] = [first.get("display") or q, en.get("display") or q,
+                                  first.get("kind") or "", en.get("kind") or ""]
             continue
-        seen_q.add(q)
+        seen_q[q] = en
         uniq.append(en)
     entities = uniq
 
@@ -1143,22 +1613,125 @@ def parse_query(raw: str, context: Optional[Dict] = None) -> Dict:
     intents = _select_intents(found)
     focus = _focus_terms(t2, found)
 
+    out["form"] = _qb.question_form(t2) if _qb else ""
+    # 'how long do the side effects last' asks about side effects, not PK (the
+    # long 'how long do …' PK match swallows the side-effect words)
+    if re.search(r"side[- ]?effects?[^?.!]{0,25}\b(?:last|go away|wear off|stop|disappear|"
+                 r"fade|subside|get better|ease)|how long (?:does|do|will) (?:the |my |this )?"
+                 r"(?!(?:one |a |each |single )?(?:dose|tablet|pill|capsule))(?:\w+ ){1,3}"
+                 r"(?:from|on|caused by|of) drugx (?:last|go away|wear off)", t2):
+        intents = ["side_effects"] + [x for x in intents if x not in ("side_effects", "pk")]
+    # questions where one topic's words are decisive over incidental ones
+    if re.search(r"drug tests?|urine tests?|false positives?|show (?:up )?(?:on|in) (?:a )?\w+ tests?", t):
+        intents = ["pk"] + [x for x in intents if x != "pk"]
+    if "dosing" in intents and re.search(
+            r"\bcourse of|stay on (?:it|drugx)|be on (?:it|drugx)|for (?:years|months|life|a long time)|"
+            r"how many (?:days|weeks) (?:should|do|must|can|will) (?:i|you)", t2):
+        intents = ["dosing"] + [x for x in intents if x != "dosing"]
+    if "overdose" in intents and re.search(r"overdos\w*|poison\w*|toxicity|too much|too many", t):
+        intents = ["overdose"] + [x for x in intents if x != "overdose"]
+    if "pregnancy" in intents and intents[0] in ("side_effects", "warnings"):
+        intents = ["pregnancy"] + [x for x in intents if x != "pregnancy"]
+    if re.search(r"(?:should|must) avoid|not suitable|unsuitable|contraindicat", t):
+        intents = ["warnings"] + [x for x in intents if x != "warnings"]
+    # storage words decide even when a longer 'how long does it last…' phrase
+    # swallowed them
+    if re.search(r"\b(?:fridge|refrigerat\w*|freezer|stor(?:e|ed|age|ing)|once opened|after opening|"
+                 r"expir\w*|shelf[- ]?life|room temperature|out of date|use[- ]by)\b", t):
+        intents = ["storage"] + [x for x in intents if x != "storage"]
+    # 'does it cause dependence' is about dependence, not a side-effect list
+    if "legal" in intents and re.search(r"\bcause\w* (?:physical |psychological )?"
+                                        r"(?:dependence|addiction|withdrawal)", t):
+        intents = ["legal"] + [x for x in intents if x != "legal"]
+    # 'does it affect driving / birth control / the unborn baby' — the effect
+    # verb alone doesn't make it a side-effect question when another topic is named
+    if (len(intents) > 1 and intents[0] == "side_effects" and _EFFECT_VERB_RE.search(t2)
+            and not re.search(r"side[- ]?effects?|adverse|\bcause", t2)):
+        intents = intents[1:] + ["side_effects"]
+    # decisive topics: a storage word ('can the syrup be kept out of the
+    # fridge') or 'instead of' outranks incidental dosing/uses words
+    for decisive in ("storage", "alternatives"):
+        if decisive in intents:
+            intents = [decisive] + [x for x in intents if x != decisive]
+
+    # 'allergic to penicillin — can I take amoxicillin?': the allergen is not a
+    # second subject; the question is about the other drug's warnings
+    if _ALLERGY_RE.search(t):
+        allergen = _split_allergen(t, entities)
+        if allergen is not None:
+            entities = [en for en in entities if en is not allergen]
+            out["allergen"] = allergen.get("display") or allergen.get("query") or ""
+        else:
+            m = _ALLERGEN_WORD_RE.search(t)
+            if m and not any(en["span"][0] <= m.start(1) < en["span"][1] for en in entities):
+                out["allergen"] = m.group(1).strip()
+        personal = (re.search(r"\ballergic\b|\ballergy to\b|\b\w+ allergy\b|\ballergic reaction",
+                              t) and not re.search(r"\bfor (?:my |an? |the |seasonal )?allerg", t))
+        if out["allergen"] or (entities and personal):
+            intents = ["warnings"] + [x for x in intents if x != "warnings"]
+
+    # 'is amoxicillin a (type of) penicillin' — the second name is a CLASS here
+    if len(entities) >= 2 and re.search(
+            r"\b(?:is|are) drugx (?:an? |one of the )?(?:(?:type|kind|form|sort|member|example|"
+            r"class|part) of (?:the )?(?:an? )?)?drugx\b", t2):
+        second = entities[1]
+        if find_classes(second.get("text") or second.get("display") or "")[0]:
+            entities = [entities[0]]
+            intents = ["class"] + [x for x in intents if x != "class"]
+
     population = [p for p in ("children", "elderly") if p in intents]
     intents = [x for x in intents if x not in ("children", "elderly")]
     if population:
         out["population"] = population
         if not any(x in intents for x in ("dosing", "warnings", "side_effects", "pregnancy",
-                                          "pk")):
+                                          "pk", "overdose")):
             intents.append("population")
     if "pk" in intents:
         out["pk_facts"] = [lbl for lbl, rx in _PK_FACT_RES if rx.search(t)]
+
+    # phrasings the keyword rules miss: the nearest example in the question
+    # bank decides (see question_bank.json — add a phrasing there to teach it)
+    if USE_TEMPLATE_MATCHER:
+        t_match = t2
+        if "drugx" not in t_match and (context or {}).get("entity"):
+            t_match = _PRONOUN_RE.sub("drugx", t_match)
+        if "drugx" in t_match:
+            # topics found only by WEAK cues ('can I take…' → warnings) are
+            # guesses the example matcher may overrule
+            strong_names = {n for n, _s, _e, st in found if st}
+            weak_only = {n for n, _s, _e, _st in found} - strong_names
+            specific = [x for x in intents if x not in ("overview", "search") and x not in weak_only]
+            chosen = None
+            hit = template_match(t_match)
+            if hit and hit[1] >= MATCH_STRONG:
+                qtype, score, _ex = hit
+                exp = qtype.get("expect") or {}
+                if exp.get("mode") == "answer" and exp.get("topics") and (
+                        not specific or specific[0] not in exp["topics"]):
+                    chosen = (qtype, score)
+            elif not specific:
+                tm = type_match(t_match)
+                if tm and tm[1] >= TYPE_MIN and tm[1] - tm[2] >= TYPE_MARGIN:
+                    chosen = (tm[0], tm[1])
+            if chosen:
+                qtype, score = chosen
+                topic = qtype["expect"]["topics"][0]
+                intents = [topic] + [x for x in intents if x not in (topic, "overview", "search")]
+                vocab = {st for ex in _qb.examples(qtype) for st in tokens(ex)}
+                focus = [f for f in focus if stem(f) not in vocab]
+                if topic == "pk" and not out["pk_facts"]:
+                    out["pk_facts"] = [lbl for lbl, rx in _PK_FACT_RES if rx.search(t)]
+                out["template"], out["template_score"] = qtype["id"], round(score, 3)
+                forms = qtype.get("form") or []
+                if out["form"] in ("statement", "what") and forms and out["form"] not in forms:
+                    out["form"] = forms[0]
 
     # ---- leftover words: an unrecognised drug/chemical name ----
     leftover_runs: List[Tuple[int, int]] = []
     run: Optional[List[int]] = None
     prev_end = -10
     for idx, (w, s, e) in enumerate(toks):
-        ok = (not used[idx] and w not in STOPWORDS and w not in COMMON_WORDS
+        ok = (not used[idx] and w not in STOPWORDS and not _is_common(w)
               and w not in FILLER and w not in LAY_SYNONYMS and len(w) >= 2
               and not _is_intent_word(w))
         if ok and run is not None and s - prev_end <= 2:
@@ -1266,6 +1839,14 @@ def parse_query(raw: str, context: Optional[Dict] = None) -> Dict:
         focus = [f for f in focus if f not in _norm(phrase).split()]
 
     strong = entities[:3]
+    # 'why is glucagon the antidote for beta-blocker overdose' / 'how does
+    # naloxone reverse morphine' — a question about the LINK between a drug and
+    # something else, not about one topic of the drug
+    rel = relation_target(raw, strong) if strong and not _COMPARE_RE.search(t2) else ""
+    if rel:
+        out.update(mode="relation", relation_target=rel, entities=strong[:1], weak=weak,
+                   intents=intents or ["overview"], focus=focus)
+        return out
     if len(strong) >= 2:
         others = [x for x in intents if x not in ("overview", "warnings")]
         if _COMPARE_RE.search(t2):

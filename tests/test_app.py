@@ -81,6 +81,20 @@ def test_ask_compare_in_singapore_warns_about_us_labels():
     assert "None on the US label" not in md
 
 
+def test_ask_why_question_finds_the_explanation():
+    # REGRESSION 2026-10-11: showed glucagon's own overdose section instead.
+    # Needs the 'Glucagon (medication)' article, not the hormone article.
+    at = AppTest.from_file(APP, default_timeout=TIMEOUT)
+    at.run()
+    at.session_state["app_mode"] = "💬 Ask"
+    at.run()
+    at.chat_input[0].set_value("why is glucagon the antidote for beta blocker overdose").run()
+    assert not at.exception, [e.value for e in at.exception]
+    md = "\n".join(m.value for m in at.markdown)
+    assert "Glucagon ↔ beta blocker overdose" in md
+    assert "cAMP" in md and "Glucagon overdose & toxicity" not in md
+
+
 def test_ask_compare_builds_a_side_by_side_table():
     at = AppTest.from_file(APP, default_timeout=TIMEOUT)
     at.run()

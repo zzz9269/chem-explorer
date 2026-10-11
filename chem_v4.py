@@ -611,7 +611,7 @@ if HAS_STREAMLIT:
     # Bump _CACHE_VERSION when a fetcher's output shape OR selection logic changes
     # in chem_sources (else stale disk results survive restarts);
     # the sidebar's "Refresh cached data" button clears both tiers.
-    _CACHE_VERSION = "2026-10-11e"   # openfda_label: + has_boxed_section / plr_format
+    _CACHE_VERSION = "2026-10-12a"   # openfda_label: + medguide / patient_info / inactive_ingredients
 
     class _Outage(Exception):
         """Raised inside a cached fetcher so an outage's empty result is NOT
@@ -3998,6 +3998,7 @@ def load_compound(input_text: str, chosen: Dict[str, Any], source: Optional[str]
             wiki_secs = cached_wiki_sections(_title)
             if wiki_secs:
                 break
+        wiki_secs, wiki = _prefer_medication_article(wiki_secs, wiki)
         _assign_wiki_tabs(wiki_secs)
     # Merge the Wikipedia sections into the PubChem group structure so they
     # render as peer, point-form headings inside the group expanders — not as a
@@ -4065,6 +4066,22 @@ def load_compound(input_text: str, chosen: Dict[str, Any], source: Optional[str]
     }
 
 
+def _prefer_medication_article(secs: Dict[str, Any], wiki: Dict[str, Any]
+                               ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Wikipedia splits some substances into a physiology article and a drug
+    article — 'Glucagon' (the hormone) vs 'Glucagon (medication)', likewise
+    insulin, oxytocin, testosterone. The drug article is the one with medical
+    uses, dosing and e.g. why glucagon treats beta-blocker overdose, so use it
+    (sections and lead summary) whenever it exists."""
+    title = (secs or {}).get("title") or ""
+    if not title or title.endswith("(medication)"):
+        return secs, wiki
+    med = cached_wiki_sections(f"{title} (medication)")
+    if not (med and med.get("sections")) or med.get("title") == title:
+        return secs, wiki
+    return med, (cached_wiki(med["title"]) or wiki)
+
+
 def load_name_only(name: str, *, region: str = "US", drug=None) -> Dict[str, Any]:
     """Fallback context for a medicine with no small-molecule structure (a
     biologic such as insulin or adalimumab) or a name PubChem can't resolve:
@@ -4075,6 +4092,7 @@ def load_name_only(name: str, *, region: str = "US", drug=None) -> Dict[str, Any
     with st.spinner(f"Fetching FDA label and Wikipedia for {title}…"):
         wiki = cached_wiki(title) or (cached_wiki(name) if name != title else {})
         wiki_secs = cached_wiki_sections(wiki.get("title") or title) or {}
+        wiki_secs, wiki = _prefer_medication_article(wiki_secs, wiki)
         clinical = _clinical_enrichment(
             drug_hit=drug, compound_name=title, resolved_name=name, synonyms=[],
             clin_chembl={}, region=region)
@@ -4719,7 +4737,7 @@ _INTENT_ICON = {
     "population": "👪", "overdose": "☠️", "brands": "🏷", "class": "🗂",
     "alternatives": "🔁", "identifiers": "🆔", "structure": "🧪", "properties": "📊",
     "spectra": "📈", "history": "📜", "synthesis": "🏭", "legal": "⚖️", "storage": "📦",
-    "search": "🔎",
+    "cost": "💲", "ingredients": "🧾", "search": "🔎",
 }
 _CHAT_EXAMPLES = [
     "How does dextromethorphan stop me from coughing?",
@@ -4971,6 +4989,51 @@ _LABEL_TOPICS = [
     ("controlled_substance", "Controlled substance", "legal"),
     ("storage", "Storage", "storage"),
 ]
+# Medication Guide headings are patient questions; split at them.
+_MEDGUIDE_HEAD_RE = re.compile(
+    r"(?:^|(?<=\s))((?:What|How|Who|Should|Can|Do|Does|Is|Are|Where|When|Before)\b"
+    r"[^?•.!]{3,150}\?)")      # no full stop inside: a heading is one question
+# heading / subsection words → topic (first match wins)
+_PATIENT_TOPICS = [
+    ("ingredients", re.compile(r"ingredient", re.I)),
+    ("storage", re.compile(r"\bstor(?:e|age)|keep .{0,30}out of", re.I)),
+    ("side_effects", re.compile(r"side effects?|adverse", re.I)),
+    ("interactions", re.compile(r"\bavoid\b|interact|other medicines|alcohol|grapefruit", re.I)),
+    ("dosing", re.compile(r"how (?:should|do|to) (?:i |you )?(?:take|use|give)|missed? dose|"
+                          r"dosing|administ|how much", re.I)),
+    ("pregnancy", re.compile(r"pregnan|breast|nursing|lactat", re.I)),
+    ("overdose", re.compile(r"overdos|too much", re.I)),
+    ("legal", re.compile(r"abuse|dependen|addict|withdraw", re.I)),
+    ("uses", re.compile(r"^what is \S+(?: \S+){0,4}\?$|used (?:for|to)", re.I)),
+    ("warnings", re.compile(r"important information|should not|do not|before (?:taking|using|you)|"
+                            r"tell your|warning|precaution|driv|machiner", re.I)),
+]
+
+
+def _patient_topic(heading: str) -> Optional[str]:
+    for topic, rx in _PATIENT_TOPICS:
+        if rx.search(heading or ""):
+            return topic
+    return None
+
+
+def medguide_sections(text: str) -> List[Tuple[str, str, str]]:
+    """A Medication Guide → [(question heading, body, topic)]. 'General
+    information about the safe use…' boilerplate is dropped."""
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if len(text) < 80:
+        return []
+    marks = [(m.start(1), m.group(1)) for m in _MEDGUIDE_HEAD_RE.finditer(text)]
+    out = []
+    for i, (pos, head) in enumerate(marks):
+        end = marks[i + 1][0] if i + 1 < len(marks) else len(text)
+        body = text[pos + len(head):end].strip(" •")
+        if len(body) < 8 or re.search(r"general information about", head, re.I):
+            continue
+        out.append((head, body, _patient_topic(head) or "warnings"))
+    return out
+
+
 # Heading text → topic (first match wins), then the group's default topic.
 _HEADING_TOPICS = [
     ("history", re.compile(r"histor|discover|etymolog", re.I)),
@@ -5083,6 +5146,23 @@ def _chat_corpus(ctx: Dict[str, Any]) -> List[Dict[str, str]]:
                 if len(s) >= 25:
                     docs.append({"text": s, "src": "FDA label", "url": of.get("url", ""),
                                  "topic": topic, "section": f"{section}" + (f" · {title}" if title else "")})
+    # plain-language patient text (Medication Guide Q&A, counseling) — what
+    # practical questions (missed dose, crushing, alcohol, driving) need
+    for heading, body, topic in medguide_sections(of.get("medguide") or ""):
+        for s in _split_sentences(body):
+            if len(s) >= 20:
+                docs.append({"text": s, "src": "FDA label", "url": of.get("url", ""),
+                             "topic": topic, "section": f"Medication Guide · {heading}"})
+    for title, body in _label_chunks(of.get("patient_info") or ""):
+        topic = _patient_topic(title or body[:80]) or "warnings"
+        for s in _split_sentences(body):
+            if len(s) >= 25:
+                docs.append({"text": s, "src": "FDA label", "url": of.get("url", ""),
+                             "topic": topic, "section": "Patient counseling" + (f" · {title}" if title else "")})
+    if len(of.get("inactive_ingredients") or "") > 3:
+        docs.append({"text": "Inactive ingredients: " + of["inactive_ingredients"].strip(),
+                     "src": "FDA label", "url": of.get("url", ""), "topic": "ingredients",
+                     "section": "Inactive ingredients"})
     lead = (ctx.get("wiki") or {}).get("extract") or ""
     for s in _split_sentences(lead):
         docs.append({"text": s, "src": "Wikipedia", "url": (ctx.get("wiki") or {}).get("url", ""),
@@ -6596,6 +6676,888 @@ def _ans_search(ctx, name, p):
                              "— here's the overview instead.")] + _ans_overview(ctx, name, p))
 
 
+# =========================== Short answers ===================================
+# A question's FORM decides how the answer opens: a yes/no question gets a
+# verdict, 'how long' a duration, 'how much' a dose. Every verdict is derived
+# from quoted source text (or computed from the structure) and says which; when
+# the sources are silent it says so — never 'safe' by default.
+_NEG_BEFORE_RE = re.compile(
+    r"\b(?:no|not|never|without|neither|nor|unlikely|rarely|lack(?:s|ing)? of|absence of|free of|"
+    r"does not|doesn't|did not|is not|isn't|are not|aren't|was not|were not|has not|have not|"
+    r"cannot|can't|won't|will not|minimal|little|slight(?:ly)?|lower risk of)\b[^.;:]{0,45}$",
+    re.I)
+# symptom words whose lay synonyms are safe to add (direction-neutral)
+_EFFECT_SYNONYMS = {
+    "sleepy": ("drowsiness", "somnolence", "sedation", "sleep aid", "sleep-aid", "nighttime sleep"),
+    "drowsy": ("drowsiness", "somnolence", "sedation"),
+    "drowsiness": ("somnolence", "sedation", "drowsy"), "tired": ("fatigue", "somnolence"),
+    "tiredness": ("fatigue",), "dizzy": ("dizziness", "vertigo"), "dizziness": ("dizzy", "vertigo"),
+    "itchy": ("pruritus", "itching"), "itching": ("pruritus",), "hair": ("alopecia",),
+    "nausea": ("nauseous",), "vomiting": ("emesis",), "headache": ("headaches",),
+    "insomnia": ("sleeplessness", "difficulty sleeping"), "libido": ("sexual desire",),
+    "constipation": ("constipated",), "diarrhea": ("diarrhoea",), "diarrhoea": ("diarrhea",),
+}
+_GENERIC_EFFECT_WORDS = {"side", "effect", "effects", "cause", "causes", "caused", "causing", "make",
+                         "makes", "feel", "get", "give", "lead", "leads", "drugx", "taking", "take",
+                         "you", "me", "people", "does", "can", "will", "could", "would", "might",
+                         "may", "common", "rare", "normal", "linked", "associated", "risk",
+                         "chance", "chances", "percentage", "likely", "possible", "really", "actually",
+                         "safe", "okay", "bad", "good", "taken", "using", "use", "medicine", "drug",
+                         "tablet", "tablets", "pill", "pills", "anyone", "someone", "body", "my", "your"}
+# words dropped from an effect phrase ('blood sugar' ≈ 'glucose', 'levels')
+_OPTIONAL_EFFECT_WORDS = {"blood", "level", "levels", "plasma", "serum"}
+# direction-preserving substitutes for a word inside the phrase
+_PHRASE_SUBS = {
+    "raise": ("increas", "elevat", "rais"), "raises": ("increas", "elevat"),
+    "increase": ("increas", "elevat", "rais"), "lower": ("lower", "reduc", "decreas"),
+    "lowers": ("lower", "reduc", "decreas"), "reduce": ("reduc", "lower", "decreas"),
+    "sugar": ("glucose", "glycem", "glycaem"), "gain": ("gain", "increas"),
+    "loss": ("loss", "lose", "decreas", "reduc"), "pressure": ("pressure",),
+}
+
+
+def _effect_patterns(words: List[str]) -> List[re.Pattern]:
+    """Patterns for an effect phrase: all its words present (as 5-letter
+    prefixes, any order: 'weight gain' ≈ 'gained weight'), the same with
+    direction-preserving substitutes ('lower blood sugar' ≈ 'reduces glucose'),
+    plus direction-neutral medical synonyms ('sleepy' → somnolence)."""
+    words = [w.lower() for w in words if len(w) >= 3 and w.lower() not in _GENERIC_EFFECT_WORDS
+             and w.lower() not in _OPTIONAL_EFFECT_WORDS]
+    if not words:
+        return []
+
+    def piece(w: str) -> str:
+        """One word as a regex: symptom words exactly ('sleepy' must not
+        match 'sleeplessness'), others by their first 5 letters."""
+        if w in _EFFECT_SYNONYMS:
+            stem_ = w[:-1] if w.endswith("y") else w
+            return rf"\b{re.escape(stem_)}(?:y|iness|ness|s|ed|ing)?\b"
+        return rf"\b{re.escape(w[:5])}(?!less)\w*"
+    variants = [[piece(w) for w in words]]
+    for i, w in enumerate(words):
+        for sub in _PHRASE_SUBS.get(w, ()):
+            for base in list(variants):
+                v = list(base)
+                v[i] = rf"\b{re.escape(sub)}\w*"
+                if v not in variants:
+                    variants.append(v)
+        if len(variants) > 12:
+            break
+    pats = []
+    for v in variants:
+        if len(v) == 1:
+            pats.append(v[0])
+        elif len(v) == 2:
+            # a two-word effect must be a phrase, in either order, ≤3 words apart
+            a, b = v
+            gap = r"\W+(?:\w+\W+){0,3}?"
+            pats.append(rf"{a}{gap}{b}|{b}{gap}{a}")
+        else:
+            pats.append("".join(rf"(?=.*{p})" for p in v))
+    for w in words:
+        for syn in _EFFECT_SYNONYMS.get(w, ()):
+            pats.append(rf"\b{re.escape(syn)}\w*")
+    ws = set(words)
+    for verbs, nouns, terms in _DIRECTIONAL_TERMS:
+        if ws & verbs and ws & nouns:
+            pats += [rf"\b{re.escape(t)}\w*" for t in terms]
+    return [re.compile(p, re.I | re.S) for p in pats]
+
+
+# (direction words, subject words, the single medical term meaning both)
+_DIRECTIONAL_TERMS = [
+    ({"raise", "raises", "increase", "increases", "high", "spike"}, {"sugar", "glucose"},
+     ("hyperglyc",)),
+    ({"lower", "lowers", "reduce", "reduces", "low", "drop"}, {"sugar", "glucose"}, ("hypoglyc",)),
+    ({"raise", "raises", "increase", "increases", "high"}, {"pressure"}, ("hypertens",)),
+    ({"lower", "lowers", "reduce", "reduces", "low", "drop"}, {"pressure"}, ("hypotens",)),
+    ({"raise", "raises", "increase", "increases", "high"}, {"potassium"}, ("hyperkal",)),
+    ({"lower", "lowers", "reduce", "reduces", "low"}, {"potassium"}, ("hypokal",)),
+    ({"lower", "lowers", "reduce", "reduces", "low"}, {"sodium"}, ("hyponatr",)),
+    ({"raise", "raises", "increase", "fast", "faster"}, {"heart", "rate"}, ("tachycard",)),
+    ({"lower", "slow", "slows", "slower"}, {"heart", "rate"}, ("bradycard",)),
+]
+
+
+def _question_words(p: Dict[str, Any], name: str = "") -> List[str]:
+    """The content words of the question itself (not just the router's focus,
+    which loses words swallowed by topic phrases — 'weight gain', 'make you
+    sleepy', 'cross the placenta'), minus the drug's own name."""
+    raw = (p.get("raw") or "").lower()
+    ent = p.get("_entity") or {}
+    drop = set()
+    for s in (name, ent.get("text"), ent.get("display"), ent.get("query")):
+        drop |= set(re.findall(r"[a-z0-9]+", (s or "").lower()))
+    words = []
+    for w in re.findall(r"[a-z][a-z\-]+", raw):
+        if w in drop or len(w) < 3 or w in _GENERIC_EFFECT_WORDS:
+            continue
+        if cr is not None and w in cr.STOPWORDS:
+            continue
+        if w not in words:
+            words.append(w)
+    return words
+
+
+def _negated(text: str, pats: List[re.Pattern]) -> bool:
+    """True when the effect is mentioned under a negation ('does not cause
+    weight gain', 'no evidence of drowsiness')."""
+    for rx in pats:
+        m = rx.search(text)
+        if not m:
+            continue
+        # lookahead patterns match at 0 — find the first content word instead
+        span_start = m.start()
+        if m.end() == m.start():
+            first = re.search(r"\b\w", text[m.start():])
+            words = [p for p in re.findall(r"\\b(\w+)", rx.pattern)]
+            hits = [re.search(rf"\b{re.escape(w)}", text, re.I) for w in words]
+            hits = [h.start() for h in hits if h]
+            span_start = min(hits) if hits else (first.start() if first else 0)
+        if _NEG_BEFORE_RE.search(text[max(0, span_start - 60):span_start]):
+            return True
+    return False
+
+
+_USE_WORDING_RE = re.compile(r"\bused (?:as|to|for|in)\b|\bindicated\b|\btreat\w*|\bhelps? (?:with|you)\b|"
+                             r"\bsleep aid\b|\bfor the (?:relief|treatment|management)\b", re.I)
+_DIRECTION_WORDS = {"raise", "raises", "increase", "increases", "lower", "lowers", "reduce", "reduces",
+                    "decrease", "decreases", "lose", "losing", "high", "low", "spike", "drop", "thin",
+                    "slow", "speed"}
+_COUNTER_RE = re.compile(r"\b(?:counteract\w*|counter(?:s|ing)?|prevent\w*|reduc\w*|treat\w*|against|"
+                         r"revers\w*|reliev\w*|lower\w*|decreas\w*|block\w*|inhibit\w*|suppress\w*|"
+                         r"protect\w* (?:against|from)|without causing|attenuat\w*|mitigat\w*|"
+                         r"limit\w*|offset\w*|minimi[sz]\w*)\b[^.;]{0,45}$", re.I)
+
+
+def _counters(text: str, pats: List[re.Pattern]) -> bool:
+    """True when the effect is named as something the drug works AGAINST
+    ('counteracting the weight gain caused by…', 'prevents nausea')."""
+    for rx in pats:
+        m = rx.search(text)
+        if not m:
+            continue
+        words = re.findall(r"\\b(\w+)", rx.pattern)
+        pos = [h.start() for h in (re.search(rf"\b{re.escape(w)}", text, re.I) for w in words) if h]
+        start = min(pos) if pos else m.start()
+        if _COUNTER_RE.search(text[max(0, start - 60):start]):
+            return True
+    return False
+
+
+def _verdict(text: str, quote: Optional[Tuple[str, str, str]] = None) -> List[Dict[str, Any]]:
+    items = [(text, "", "")]
+    if quote and quote[0]:
+        items.append((f"“{_tidy(quote[0])[:320]}”", quote[1], quote[2]))
+    return [_b("answer", items=items, label="Short answer")]
+
+
+def _scan(ctx, pats: List[re.Pattern], topics=None):
+    """Corpus docs matching any pattern → (doc, negated), label first."""
+    out = []
+    for d in _chat_corpus(ctx):
+        if topics is not None and d["topic"] not in topics:
+            continue
+        if any(rx.search(d["text"]) for rx in pats):
+            out.append((d, _negated(d["text"], pats)))
+    out.sort(key=lambda x: (x[0]["src"] != "FDA label", len(x[0]["text"])))
+    return out
+
+
+def _q(d, pats: Optional[List[re.Pattern]] = None) -> Tuple[str, str, str]:
+    """A source quote; with effect patterns, centred on the matched words so a
+    long list ('most common side effects include: …') shows the right part."""
+    text = d["text"]
+    if pats and len(text) > 260:
+        words = [w for rx in pats for w in re.findall(r"\\b(\w+)", rx.pattern)]
+        pos = [h.start() for h in (re.search(rf"\b{re.escape(w)}", text, re.I) for w in words) if h]
+        if pos:
+            s = max(0, min(pos) - 110)
+            e = min(len(text), min(pos) + 150)
+            while s > 0 and text[s - 1] not in " .;•":
+                s -= 1
+            text = ("…" if s > 0 else "") + text[s:e].strip() + ("…" if e < len(d["text"]) else "")
+    return (text, d["src"], d.get("url", ""))
+
+
+def _effect_verdict(ctx, name, p):
+    """'Does X cause Y?' — intended effect / listed on the label / reported
+    elsewhere / sources say no / not mentioned."""
+    focus = [w for w in _question_words(p, name) if w not in _OPTIONAL_EFFECT_WORDS]
+    if not focus:
+        return []
+    effect = " ".join(focus)
+    pats = _effect_patterns(focus)
+    if not pats:
+        return []
+    hits = _scan(ctx, pats)
+    # a 'uses' sentence about the effect can mean the drug PRODUCES it ('lowers
+    # blood glucose') or COUNTERS it ('counteracting the weight gain caused by
+    # antipsychotics') — the direction decides the verdict
+    has_dir = bool(set(w.lower() for w in focus) & _DIRECTION_WORDS)
+    uses_hits = [d for d, neg in hits if not neg and d["topic"] in ("uses", "mechanism")]
+    opposes = [d for d in uses_hits if not has_dir and _counters(d["text"], pats)]
+    # 'intended' needs a direction question ('does it lower blood sugar') or
+    # real use wording ('used as a sleep aid') — a mechanism sentence that
+    # merely mentions the effect ('produces minimal sedation') is not a use
+    intended = [d for d in uses_hits if d not in opposes and (
+        has_dir or (d["topic"] == "uses" and _USE_WORDING_RE.search(d["text"])))]
+    # normal-dose side-effect evidence vs mentions only after an overdose
+    se_topics = ("side_effects", "warnings", "children", "elderly", "pregnancy", "toxicity", "legal")
+    rank = {"side_effects": 0, "warnings": 1, "pregnancy": 2, "elderly": 2, "children": 3, "legal": 3,
+            "toxicity": 4}
+
+    def strength(d):          # the side-effect list (with an incidence %) first
+        return (rank.get(d["topic"], 6), "%" not in d["text"], len(d["text"]))
+
+    def usable(d):
+        return d["topic"] in se_topics and not _counters(d["text"], pats) and not re.search(
+            r"\boverdos\w*|took (?:\d|an? (?:overdose|large))|too much|more than directed", d["text"], re.I)
+    label_pos = sorted((d for d, neg in hits if not neg and d["src"] == "FDA label" and usable(d)),
+                       key=strength)
+    other_pos = sorted((d for d, neg in hits if not neg and d["src"] != "FDA label" and usable(d)),
+                       key=strength)
+    overdose_only = [d for d, neg in hits if not neg and (d["topic"] == "overdose" or re.search(
+        r"\boverdos\w*|too much|more than directed", d["text"], re.I))]
+    negs = [d for d, neg in hits if neg]
+    # 'produces minimal sedation compared to…' is a RELATIVE statement (weak),
+    # not a denial like 'does not cause sedation' (strong)
+    weak_negs = [d for d in negs if re.search(r"\b(?:minimal|little|slight(?:ly)?|lower risk|compared|"
+                                              r"than|less)\b", d["text"], re.I)
+                 and not re.search(r"\b(?:not|no|never|without|doesn't|isn't|aren't|cannot)\b",
+                                   d["text"], re.I)]
+    negs = [d for d in negs if d not in weak_negs]
+    e = _md_safe(effect)
+    n = _md_safe(name)
+    if other_pos and weak_negs and not negs and not label_pos:
+        return _verdict(f"**Yes — reported as a side effect** in {other_pos[0]['src']}, though some "
+                        "sources describe it as mild or less than with similar drugs.",
+                        _q(other_pos[0], pats))
+    if weak_negs and not (label_pos or other_pos or negs):
+        return _verdict("**Uncommon or mild, according to the sources:**", _q(weak_negs[0], pats))
+    if re.search(r"\bnon[- ]?(?:drowsy|sedating)\b", p.get("raw") or "", re.I):
+        ev = (label_pos or other_pos or overdose_only or negs or [None])[0]
+        if ev is None:
+            return _verdict(f"**Drowsiness isn't mentioned** in {n}'s sources.")
+        return _verdict("**What the sources say about drowsiness:**", _q(ev, pats))
+    if opposes and not label_pos:
+        return _verdict(f"**No — the sources describe {n} as working against this**, not causing it.",
+                        _q(opposes[0], pats))
+    if intended and (has_dir or not label_pos):
+        use = [d for d in intended if d["topic"] == "uses"]
+        if use:
+            return _verdict(f"**Yes — that's an intended effect** — it's part of what {n} is used for.",
+                            _q(use[0], pats))
+        # a mechanism sentence: a known pharmacological effect, not the purpose
+        return _verdict(f"**Yes — it's a known effect of how {n} works**, which can matter as a side "
+                        "effect too.", _q(intended[0], pats))
+    if label_pos:
+        return _verdict(f"**Yes — {n}'s US FDA label lists it.**", _q(label_pos[0], pats))
+    if other_pos and not negs:
+        return _verdict(f"**Yes — reported as a side effect** in {other_pos[0]['src']} (it isn't in "
+                        "the FDA label text I have).", _q(other_pos[0], pats))
+    if overdose_only and not negs and not other_pos:
+        return _verdict("**Mainly in overdose** — the sources mention it after taking too much:",
+                        _q(overdose_only[0], pats))
+    if negs and not other_pos:
+        return _verdict(f"**Not usually — the sources describe {_md_safe(name)} as not causing "
+                        f"{e}.**", _q(negs[0], pats))
+    if negs and other_pos:
+        return _verdict(f"**The sources differ on {e}** — some report it, some say it doesn't "
+                        "happen. Ask a pharmacist about your situation.", _q(other_pos[0], pats))
+    return _verdict(f"**Not mentioned** — {e} isn't listed in {_md_safe(name)}'s FDA label, "
+                    "PubChem or Wikipedia text. That doesn't rule it out — ask a pharmacist.")
+
+
+_AVOID_RE = re.compile(r"\b(?:avoid|do not|don't|should not|must not|not recommended|contraindicat\w*|"
+                       r"disulfiram|severe|serious|dangerous|increase[sd]? the risk|may increase|"
+                       r"potentiat\w*|enhance[sd]?|discontinue|abstain|refrain)\b", re.I)
+_STRONG_AVOID_RE = re.compile(
+    r"\b(?:avoid(?:ed)?|discontinue (?:the )?consumption|abstain|refrain|do not (?:drink|consume|take|use|"
+    r"eat)|should not (?:drink|consume|be (?:taken|used|consumed))|must not|not be consumed|"
+    r"contraindicated)\b", re.I)
+
+
+def _interactant_verdict(ctx, name, p):
+    target = (p.get("interactant") or "").strip()
+    if not target:
+        return []
+    terms = _INTERACTANT_TERMS.get(target.lower(), [target])
+    hits = _mentions(ctx, terms, topics={"interactions", "warnings", "side_effects", "dosing", "pk",
+                                         "overdose"}, k=6)
+    t = _md_safe(target)
+    if not hits:
+        return _verdict(f"**No warning found** about {t} in {_md_safe(name)}'s FDA label, PubChem "
+                        "or Wikipedia text — that isn't proof it's safe. Ask a pharmacist.")
+    # an explicit instruction about the substance beats a sentence that merely
+    # contains a warning word ('…psychotic reactions with disulfiram…')
+    def caution_score(h):
+        s = h[0]
+        sc = 3 if _STRONG_AVOID_RE.search(s) else (1 if _AVOID_RE.search(s) else 0)
+        sc += 1 if re.search(r"beverage|drink|consum|intake", s, re.I) else 0
+        return sc
+    ranked = sorted(hits, key=lambda h: (-caution_score(h), h[1] != "FDA label", len(h[0])))
+    caution = ranked[0] if caution_score(ranked[0]) > 0 else None
+    if caution:
+        where = "its FDA label" if caution[1] == "FDA label" else caution[1]
+        return _verdict(f"**Caution — {where} warns about {t} with {_md_safe(name)}.**", caution)
+    return _verdict(f"**The sources mention {t} with {_md_safe(name)}** (no explicit warning):",
+                    hits[0])
+
+
+def _class_member_verdict(ctx, name, p):
+    slugs = p.get("class_slugs") or []
+    phrase = p.get("class_phrase") or ""
+    drug = ctx.get("drug_hit")
+    if not slugs or not drug or not HAS_DRUG_LIBRARY:
+        return []
+    member = [s for s in slugs if s in (drug.get("classes") or [])]
+    if member:
+        cname = dl.class_name(member[0])
+        return _verdict(f"**Yes — {_md_safe(name)} is classed as {_md_safe(cname)}** "
+                        f"({dl.class_system(member[0])}).")
+    own: List[str] = []
+    for s in drug.get("classes") or []:
+        cname = dl.class_name(s)
+        if re.search(r"established pharmacologic|chemical structure|mechanism of action|physiologic effect|"
+                     r"^drugs?$|^other\b", cname, re.I):
+            continue
+        if not any(cname.lower().rstrip("s") == o.lower().rstrip("s") for o in own):
+            own.append(cname)
+    own = own[:3]
+    return _verdict(f"**No — {_md_safe(name)} isn't in the {_md_safe(phrase or dl.class_name(slugs[0]))} "
+                    f"class** in WHO ATC / FDA classifications. It's classed as: "
+                    f"{_md_safe(', '.join(own)) or 'not recorded'}.")
+
+
+_RX_Q_RE = re.compile(r"prescription|over[- ]the[- ]counter|\botc\b|buy|available|availab|"
+                      r"pharmacy|get (?:it|drugx)|sold", re.I)
+
+
+def _availability_verdict(ctx, name, p):
+    if not _RX_Q_RE.search(p.get("raw") or ""):
+        return []
+    market = ctx.get("market") or {}
+    n = _md_safe(name)
+    if ctx.get("region") == "SG" and HAS_SG_REGISTER:
+        sg = market.get("sg")
+        if not sg:
+            return _verdict(f"**No HSA-registered {n} product found** — it may not be sold in "
+                            "Singapore.")
+        classes = sg.get("classes") or []
+        if classes == ["POM"]:
+            head = f"**Prescription-only in Singapore** — every registered {n} product is POM."
+        elif "GSL" in classes:
+            head = (f"**No prescription needed for some {n} products in Singapore** — "
+                    "general-sale packs exist (larger packs/strengths may need one).")
+        elif "P" in classes:
+            head = (f"**Pharmacy-only in Singapore** — from a pharmacist without a prescription "
+                    "(some strengths may be prescription-only).")
+        else:
+            head = f"**Singapore availability:** {sgr.availability_text(sg)}"
+        return _verdict(head + f"  \n<small>{_md_safe(sgr.availability_text(sg))} · HSA register</small>")
+    avail = _availability_label(market, ctx.get("label") or {})
+    return _verdict(f"**{_md_safe(avail)}.**") if avail else []
+
+
+_SCHEDULE_RE = re.compile(r"(?i:\bschedule)\s*(?:C-?)?(I{1,3}V?|IV|V|[1-5])\b|\bC-(II|III|IV|V)\b")
+
+
+def _controlled_verdict(ctx, name, p):
+    of = ctx.get("label") or {}
+    if not of:
+        return []
+    ctrl, abuse = of.get("controlled_substance") or "", of.get("abuse") or ""
+    n = _md_safe(name)
+    m = _SCHEDULE_RE.search(ctrl) or _SCHEDULE_RE.search(abuse[:600])
+    if m:
+        sch = (m.group(1) or m.group(2)).upper()
+        return _verdict(f"**Yes — {n} is a controlled substance in the US (Schedule {sch})**, "
+                        "meaning it has recognised abuse/dependence potential.",
+                        (_first_sentence(ctrl or abuse, 260), "FDA label", of.get("url", "")))
+    if re.search(r"not (?:a )?controlled", ctrl + " " + abuse, re.I):
+        extra = ""
+        if re.search(r"dependen|withdraw|tolerance", abuse, re.I):
+            extra = " The label does discuss dependence/withdrawal — see below."
+        return _verdict(f"**No — {n} is not a controlled substance in the US.**{extra}")
+    if abuse:
+        return _verdict(f"**The label discusses abuse/dependence for {n}:**",
+                        (_first_sentence(abuse, 260), "FDA label", of.get("url", "")))
+    return _verdict(f"**No controlled-substance or abuse/dependence section** on {n}'s US label.")
+
+
+def _uses_verdict(ctx, name, p):
+    focus = [w for w in (p.get("focus") or []) if w not in ("drugx",)]
+    if not focus:
+        return []
+    cond = " ".join(focus)
+    words = focus + [s for w in focus for s in (cr.LAY_SYNONYMS.get(w, ()) if cr else ())
+                     if " " not in s][:6]
+    pats = [re.compile(rf"\b{re.escape(w[:5])}\w*", re.I) for w in words if len(w) >= 3]
+    if not pats:
+        return []
+    of = ctx.get("label") or {}
+    n, c = _md_safe(name), _md_safe(cond)
+    for field in ("indications", "purpose"):
+        for s in _split_sentences(of.get(field) or ""):
+            if any(rx.search(s) for rx in pats):
+                return _verdict(f"**Yes — it's covered by {n}'s FDA-approved uses.**",
+                                (s, "FDA label", of.get("url", "")))
+    ch = ctx.get("clin_chembl") or {}
+    for ind in ch.get("indications") or []:
+        if any(rx.search(ind.get("condition") or "") for rx in pats):
+            if ind.get("phase") == 4:
+                return _verdict(f"**Yes — approved for {_md_safe(ind['condition'])}** (ChEMBL).")
+            return _verdict(f"**Investigated, not approved** — {_md_safe(ind['condition'])} has been "
+                            f"studied (phase {ind.get('phase')} trials, ChEMBL) but isn't an approved use.")
+    hits = [d for d, neg in _scan(ctx, pats, topics={"uses", "overview"}) if not neg]
+    if hits:
+        return _verdict(f"**Sometimes — {hits[0]['src']} mentions it as a use**, but it isn't among "
+                        "the FDA-approved uses I have.", _q(hits[0]))
+    return _verdict(f"**Not among {n}'s documented uses** in the FDA label, ChEMBL, PubChem or "
+                    f"Wikipedia text for “{c}”.")
+
+
+def _mention_verdict(ctx, name, p, topics, subject: str):
+    """Generic yes/no from a mention with negation handling ('does it cross the
+    placenta', 'is it a prodrug')."""
+    focus = _question_words(p, name)
+    pats = _effect_patterns(focus)
+    if not pats:
+        return []
+    hits = _scan(ctx, pats, topics=topics)
+    if hits:
+        d, neg = hits[0]
+        return _verdict("**No, according to the sources:**" if neg
+                        else "**Yes, according to the sources:**", _q(d))
+    # 'cleared by the liver OR the kidneys' — no sentence names both: report
+    # what the sources say about either, without forcing a yes/no
+    singles = [rx for w in focus if len(w) >= 4 for rx in _effect_patterns([w])]
+    hits = _scan(ctx, singles, topics=topics)
+    if hits:
+        return _verdict("**What the sources say:**", _q(hits[0][0]))
+    return _verdict(f"**Not stated** — {_md_safe(name)}'s sources don't say anything about "
+                    f"{_md_safe(subject or ' '.join(focus))}.")
+
+
+def _chem_verdict(ctx, name, p):
+    raw = (p.get("raw") or "").lower()
+    smiles = ctx.get("smiles") or ""
+    if not smiles:
+        return []
+    core = largest_fragment_smiles(smiles) or smiles
+    mol = Chem.MolFromSmiles(core)
+    if mol is None:
+        return []
+    if re.search(r"chiral|stereo|enantiomer|optical|isomer", raw):
+        try:
+            centres = Chem.FindMolChiralCenters(mol, includeUnassigned=True, useLegacyImplementation=False)
+        except Exception:  # noqa: BLE001
+            centres = []
+        n = len(centres)
+        if n:
+            return _verdict(f"**Yes — {n} stereocentre{'s' if n != 1 else ''}**, so it is chiral "
+                            "(computed from the structure).  \n<small>Derived · RDKit</small>")
+        return _verdict("**No — no stereocentres**, so it's achiral (computed from the structure)."
+                        "  \n<small>Derived · RDKit</small>")
+    if re.search(r"\b(?:acid|acidic|base|basic|alkaline|ioni[sz]\w*|charge|pka|neutral)\b", raw):
+        ab = ci.infer_acid_base(core)
+        acids = [c for c in ab["centres"] if c["role"] == "acid"]
+        bases = [c for c in ab["centres"] if c["role"] == "base"]
+        def desc(cs_):
+            return ", ".join(f"{c['name'].lower()} (pKa ≈ {c['pka'][0]:g}–{c['pka'][1]:g})" for c in cs_)
+        if acids and bases:
+            kind = "Both acidic and basic (amphoteric)"
+        elif acids:
+            kind = "A (weak) acid"
+        elif bases:
+            kind = "A (weak) base"
+        else:
+            kind = "Essentially neutral — no ionisable acid/base groups recognised"
+        q = ab.get("net_charge_estimate", 0)
+        charge = ("it is mostly uncharged" if q == 0 else
+                  f"it is mostly {'negatively' if q < 0 else 'positively'} charged (net ≈ {q:+d})")
+        detail = "; ".join(x for x in (desc(acids), desc(bases)) if x)
+        measured = [d for d in _chat_corpus(ctx) if d["topic"] == "properties"
+                    and re.search(r"\bpka\b|dissociation", d["text"], re.I)]
+        lines = [(f"**{kind}.**" + (f" Ionisable groups: {_md_safe(detail)}." if detail else "")
+                  + f" At pH 7.4 {charge}.  \n<small>Inferred from functional groups — "
+                  "Henderson–Hasselbalch reasoning, not a measurement</small>", "", "")]
+        if measured:
+            lines.append((f"Measured: {_tidy(measured[0]['text'])[:200]}", measured[0]["src"],
+                          measured[0].get("url", "")))
+        return [_b("answer", items=lines, label="Short answer")]
+    if re.search(r"solub|dissolv|water", raw):
+        measured = [d for d in _chat_corpus(ctx) if d["topic"] == "properties"
+                    and re.search(r"solubility", d["text"], re.I)]
+        if measured:
+            return _verdict("**Measured solubility:**", _q(measured[0]))
+        tend = ci.infer_solubility_tendency(core)
+        if tend:
+            return _verdict(f"**{_md_safe(tend['tendency'].capitalize())}** — reasoned from logP, "
+                            "polarity and ionisation, not measured.  \n<small>Inferred</small>")
+    return []
+
+
+# ---- durations, doses, frequency, timing ----
+_DUR_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:(?:to|-|–|and)\s*(\d+(?:\.\d+)?)\s*)?"
+                     r"(hours?|hrs?|h\b|minutes?|mins?|days?|weeks?)", re.I)
+_ONSET_RE = re.compile(r"\bonset of (?:action|effect|analgesia|response|activity)|\bwithin \d|"
+                       r"\bbegins? to work|\bstarts? (?:to )?work|"
+                       r"\btakes? (?:about |up to |several |a few |at least )?\d*\s*(?:-|to)?\s*\d*\s*"
+                       r"(?:minutes|hours|days|weeks)|\bpeak (?:effect|plasma|serum|concentration)|"
+                       r"\bfull (?:effect|benefit|therapeutic)|\bnoticeable\b", re.I)
+_SYSTEM_RE = re.compile(r"system|body|stay|leave|clear|drug test|detect|urine|wear off|out of", re.I)
+_CLINICAL_ONSET_RE = re.compile(
+    r"\bonset of (?:action|effect|analgesia|response|activity)|"
+    r"(?:may|can|might|will) take (?:several |a few |up to |about |at least )?[\d\-–to ]*(?:weeks|days)|"
+    r"(?:within|after) (?:\d+|several|a few|one|two|three|four) (?:weeks|days|minutes|hours) of "
+    r"(?:starting|treatment|therapy|use|taking)|(?:start|begin|starts|begins) (?:to )?(?:work|feel)|"
+    r"feel (?:better|the effect)|full (?:effect|benefit|therapeutic effect)|therapeutic (?:effect|response)|"
+    r"works? within|effects? (?:begin|start|appear|are felt)|within \d+\s*(?:minutes|min)\b", re.I)
+_PK_PEAK_RE = re.compile(r"plasma|serum|C ?max|\bconcentration|bioavailab|AUC\b", re.I)
+# washout periods ('within 2 weeks of stopping an MAOI') are not onset
+_WASHOUT_RE = re.compile(r"\bMAOI|after stopping|of stopping|discontinu|washout", re.I)
+
+
+def _duration_lead(ctx, name, p):
+    raw = p.get("raw") or ""
+    onset = "Onset" in (p.get("pk_facts") or []) or re.search(
+        r"take\w* (?:to work|effect)|kick|start\w* work|how (?:fast|quickly|soon)", raw, re.I)
+    if onset:
+        cands = [d for d in _chat_corpus(ctx) if d["topic"] in ("pk", "dosing", "uses", "mechanism",
+                                                                "overview", "warnings")
+                 and _ONSET_RE.search(d["text"]) and _DUR_RE.search(d["text"])]
+
+        # 'how long until it works' means the clinical effect (weeks for an
+        # antidepressant), not when blood levels peak (hours)
+        def onset_score(d):
+            s = d["text"]
+            sc = 3 if _CLINICAL_ONSET_RE.search(s) else 0
+            sc -= 2 if _PK_PEAK_RE.search(s) else 0
+            sc -= 4 if _WASHOUT_RE.search(s) else 0
+            sc += 0.5 if d["src"] == "FDA label" else 0
+            return sc
+        cands = [d for d in cands if not _WASHOUT_RE.search(d["text"])]
+        cands.sort(key=lambda d: (-onset_score(d), len(d["text"])))
+        if cands and onset_score(cands[0]) > 0:
+            return _verdict("**How soon it works:**", _q(cands[0]))
+        peak = next((d for d in cands if _PK_PEAK_RE.search(d["text"]) or re.search(r"\bpeak|tmax", d["text"], re.I)),
+                    None)
+        if peak:
+            return _verdict("**Time to peak blood levels** (when it starts working isn't stated):", _q(peak))
+        return []
+    items, _scope = _pk_items(ctx)
+    facts, _rest = _pk_key_facts([(s, (src, u)) for s, src, u in items])
+    hl = next(((s, payload) for lbl, s, payload in facts if lbl == "Half-life"), None)
+    if not hl:
+        return []
+    s, (src, u) = hl
+    blocks = _verdict("**Half-life:**", (s, src, u))
+    if _SYSTEM_RE.search(raw):
+        m = _DUR_RE.search(s)
+        if m:
+            lo = float(m.group(1))
+            hi = float(m.group(2)) if m.group(2) else lo
+            unit = m.group(3).lower()
+            unit = {"h": "hours", "hr": "hours", "hrs": "hours", "min": "minutes",
+                    "mins": "minutes"}.get(unit, unit if unit.endswith("s") else unit + "s")
+            span = (f"{lo * 5:g}" if lo == hi else f"{lo * 5:g}–{hi * 5:g}")
+            blocks[0]["items"].append(
+                (f"Rule of thumb: a drug is ~97% eliminated after about 5 half-lives — here roughly "
+                 f"**{span} {unit}**. Active metabolites, repeated doses and drug tests can differ.",
+                 "calculated", ""))
+    return blocks
+
+
+_MAX_Q_RE = re.compile(r"\bmax|\bmost\b|too much|limit|exceed|upper|highest|24 hours|in a day|per day|"
+                       r"a day\b", re.I)
+_MAX_S_RE = re.compile(r"\bmaximum\b|not (?:to )?exceed|no more than|do not (?:take|use|give) more than|"
+                       r"should not exceed|up to \d+(?:\.\d+)?\s*(?:mg|g|mcg|tablets?|capsules?|doses?)"
+                       r"[^.]{0,30}(?:per|a|in|each|every)\s*(?:day|24)", re.I)
+_DOSE_NUM_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:mg|mcg|µg|g\b|ml|mL|units?|tablets?|capsules?|puffs?)", re.I)
+_MAX_NUM_RE = re.compile(
+    r"(?:not (?:to )?exceed|no more than|more than|maximum(?: (?:daily|total))?(?: dose)?(?: is| of)?|"
+    r"up to)\s*\d+(?:\.\d+)?\s*(?:mg|g\b|mcg|grams?|tablets?|capsules?|doses?|caplets?|puffs?)"
+    r"[^.;]{0,40}", re.I)
+_FREQ_EXPLICIT_RE = re.compile(r"every \d+(?:\s*(?:to|-|–)\s*\d+)?\s*hours|once (?:a |per )?day|"
+                               r"twice (?:a |per )?day|(?:one|two|three|four|1|2|3|4) times (?:a|per|each) day|"
+                               r"once daily|twice daily|\bq\d+h\b|every (?:morning|evening|night)", re.I)
+_FREQ_RE = re.compile(_FREQ_EXPLICIT_RE.pattern + r"|\bdaily\b|every day", re.I)
+_CRUSH_RE = re.compile(
+    r"(?:do not|don't|should not|must not|never|not to) (?:\w+ ){0,3}(?:crush|chew|split|break|cut|open)\w*|"
+    r"swallow\w* (?:\w+ ){0,2}whole|(?:may|can|should) be (?:crushed|split|chewed|broken|cut|opened|"
+    r"sprinkled|dissolved|halved)|open\w* (?:the )?capsules? and sprinkl\w*|sprinkl\w* (?:the )?(?:contents|"
+    r"granules|pellets)", re.I)
+_TIMING_RE = re.compile(r"\b(?:morning|evening|bedtime|at night|before (?:meals?|breakfast|bed|food)|"
+                        r"after (?:meals?|food|eating)|with (?:food|meals?|a meal|milk)|empty stomach|"
+                        r"same time each day|time of day)\b", re.I)
+
+
+def _label_dose_sentences(ctx):
+    of = ctx.get("label") or {}
+    sents = [(s, "FDA label", of.get("url", "")) for s in _split_sentences(_tidy(of.get("dosage") or ""))
+             if len(s) > 20 and not _LABEL_BOILERPLATE_RE.search(s)]
+    sents += [(d["text"], d["src"], d.get("url", "")) for d in _chat_corpus(ctx)
+              if d["topic"] == "dosing" and d.get("section", "").startswith(("Medication Guide",
+                                                                            "Patient counseling"))]
+    return sents
+
+
+def _clause(text: str, rx: Optional[re.Pattern], before: int = 80, after: int = 150) -> str:
+    """The part of a long label passage around the match (OTC 'Directions'
+    panels are one unpunctuated run)."""
+    text = _tidy(text)
+    if len(text) <= 260 or rx is None:
+        return text
+    m = rx.search(text)
+    if not m:
+        return text[:260].rsplit(" ", 1)[0] + "…"
+    s, e = max(0, m.start() - before), min(len(text), m.end() + after)
+    while s > 0 and text[s - 1] not in " .;•":
+        s -= 1
+    while e < len(text) and text[e] not in " .;•":
+        e += 1
+    return ("…" if s > 0 else "") + text[s:e].strip(" ,;") + ("…" if e < len(text) else "")
+
+
+def _dose_lead(ctx, name, p):
+    if p.get("population"):
+        return []                       # the dosing section answers for the population
+    sents = _label_dose_sentences(ctx)
+    if not sents:
+        return []
+    if _MAX_Q_RE.search(p.get("raw") or ""):
+        # a stated number ('no more than 10 tablets in 24 hours') beats 'do not
+        # take more than directed'
+        hit = next((x for x in sents if _MAX_NUM_RE.search(x[0])), None)
+        rx = _MAX_NUM_RE
+        if not hit:
+            hit, rx = next((x for x in sents if _MAX_S_RE.search(x[0])), None), _MAX_S_RE
+        if hit:
+            return _verdict("**Maximum (FDA label):**",
+                            (_clause(hit[0], rx, before=40, after=60), hit[1], hit[2]))
+    hit = next((x for x in sents if _DOSE_NUM_RE.search(x[0])), None)
+    return (_verdict("**Usual dose (FDA label):**", (_clause(hit[0], _DOSE_NUM_RE), hit[1], hit[2]))
+            if hit else [])
+
+
+def _pattern_lead(ctx, p, rx: re.Pattern, title: str, topics=("dosing",),
+                  primary: Optional[re.Pattern] = None, n: int = 1):
+    """Best sentence(s) matching `rx` in the given topics — sentences matching
+    the `primary` pattern first, label text before other sources."""
+    cands = [(d["text"], d["src"], d.get("url", "")) for d in _chat_corpus(ctx)
+             if d["topic"] in topics and rx.search(d["text"])]
+    if not cands:
+        return []
+    def where(x):              # 'If you miss a dose, take it…' (match near the start) first
+        m = primary.search(x[0]) if primary else None
+        return m.start() if m else 9999
+    cands.sort(key=lambda x: (where(x) == 9999, x[1] != "FDA label", where(x) > 40, len(x[0])))
+    out = _verdict(title, (_clause(cands[0][0], primary or rx), cands[0][1], cands[0][2]))
+    seen = {_tidy(cands[0][0])[:60]}
+    for c in cands[1:]:
+        if len(out[0]["items"]) > n:
+            break
+        if _tidy(c[0])[:60] in seen or (primary and primary.search(c[0]) and n == 1):
+            continue
+        seen.add(_tidy(c[0])[:60])
+        out[0]["items"].append((f"“{_clause(c[0], rx)[:320]}”", c[1], c[2]))
+    return out
+
+
+_PRACTICAL = [
+    # (question cue, sentence pattern, main-instruction pattern, title, topics, quotes)
+    (re.compile(r"miss|forg[eo]t|skip|double up|late dose", re.I),
+     re.compile(r"miss(?:ed)? (?:a |your |the )?dose|forget|forgot|skip|double (?:the )?dose|two doses", re.I),
+     re.compile(r"miss(?:ed)? (?:a |your |the )?dose|if you forget|forget to take", re.I),
+     "**If you miss a dose:**", ("dosing", "warnings"), 2),
+    (re.compile(r"\bcrush|\bsplit|\bchew|cut (?:\w+ ){0,2}in half|\bbreak (?:it|the|them)\b|"
+                r"\bopen (?:it|the|them|\w+ capsules?)\b|\bswallow|\bhalve|dissolve", re.I),
+     _CRUSH_RE, _CRUSH_RE, "**How to take it:**", ("dosing", "warnings"), 1),
+    (re.compile(r"\bfood|meal|empty stomach|breakfast|\beat\b", re.I),
+     re.compile(r"\bfood\b|\bmeals?\b|empty stomach|\bfed\b|fasting|with milk", re.I),
+     re.compile(r"with (?:or without )?food|with meals?|empty stomach|without regard to (?:food|meals)|"
+                r"(?:before|after) (?:meals?|food|breakfast)|high[- ]fat meal", re.I),
+     "**Food:**", ("dosing", "pk", "interactions"), 1),
+    (re.compile(r"\bdriv|machiner", re.I),
+     re.compile(r"\bdriv|machiner|hazardous (?:tasks|activities)|alertness", re.I),
+     re.compile(r"\bdriv\w*|operat\w* (?:heavy )?machinery|hazardous", re.I),
+     "**Driving & machinery:**", ("warnings", "side_effects", "interactions", "dosing"), 1),
+    (re.compile(r"\bstop|taper|come off|coming off|wean|cold turkey|quit|abrupt|discontinu", re.I),
+     re.compile(r"abrupt|discontinu|stop(?:ping)? (?:taking|treatment|therapy)|taper|gradual|"
+                r"withdrawal|rebound", re.I),
+     re.compile(r"(?:do not|don't) stop|abrupt\w*|taper\w*|gradual\w* (?:reduc|decreas|withdraw)|"
+                r"discontinu\w*", re.I),
+     "**Stopping:**", ("warnings", "legal", "dosing"), 2),
+]
+
+
+def _practical_lead(ctx, name, p):
+    raw = p.get("raw") or ""
+    for cue, rx, primary, title, topics, n in _PRACTICAL:
+        if not cue.search(raw):
+            continue
+        lead = _pattern_lead(ctx, p, rx, title, topics, primary=primary, n=n)
+        if lead:
+            return lead
+        if rx is _CRUSH_RE:
+            return _verdict(f"**No crushing/splitting instructions on {_md_safe(name)}'s label.** Ask a "
+                            "pharmacist first — tablets marked ER, XR, SR (extended-release) or "
+                            "enteric-coated usually must not be crushed or chewed.")
+    return []
+
+
+def _allergy_verdict(ctx, name, p):
+    allergen = (p.get("allergen") or "").strip()
+    n = _md_safe(name)
+    if not allergen:
+        return []
+    a = _md_safe(allergen)
+    drug = ctx.get("drug_hit") or {}
+    own = [dl.class_name(s).lower() for s in drug.get("classes") or []] if HAS_DRUG_LIBRARY else []
+    stem_a = allergen.lower().rstrip("s")[:6]
+    same_class = [c for c in own if stem_a and stem_a in c]
+    base = allergen.rstrip("s")
+    hits = [h for h in _mentions(ctx, [allergen, base, base + "s"],
+                                 topics={"warnings", "side_effects"}, k=4)
+            if re.search(r"allerg|hypersensitiv|cross|reaction", h[0], re.I)]
+    if same_class:
+        return _verdict(f"**⚠️ {n} is itself in the {_md_safe(same_class[0])} class** — with a "
+                        f"{a} allergy, don't take it unless a doctor says so.",
+                        hits[0] if hits else None)
+    if hits:
+        return _verdict(f"**⚠️ Its label mentions {a} allergy** — check with a doctor or pharmacist "
+                        "before taking it.", hits[0])
+    return _verdict(f"**Its label doesn't mention {a}**, but allergies can cross-react within a "
+                    "drug family — ask a pharmacist or doctor before taking it.")
+
+
+_INGREDIENT_Q = [
+    ("lactose", re.compile(r"lactose", re.I)), ("gelatin", re.compile(r"gelatin", re.I)),
+    ("gluten", re.compile(r"gluten|wheat|starch \(wheat\)", re.I)),
+    ("sugar", re.compile(r"sucrose|sugar|glucose|dextrose|sorbitol", re.I)),
+    ("alcohol", re.compile(r"\balcohol\b|ethanol", re.I)),
+    ("dyes", re.compile(r"\bFD&C\b|\bD&C\b|dye|iron oxide|titanium dioxide|lake\b", re.I)),
+]
+
+
+def _ingredients_verdict(ctx, name, p):
+    raw = (p.get("raw") or "").lower()
+    of = ctx.get("label") or {}
+    inact = of.get("inactive_ingredients") or ""
+    if not inact:
+        mg = next((b for h, b, tp in medguide_sections(of.get("medguide") or "") if tp == "ingredients"), "")
+        inact = mg
+    n = _md_safe(name)
+    if not inact:
+        return _verdict(f"**No inactive-ingredient list** in the US label data I have for {n}. "
+                        "Check your product's leaflet — ingredients vary by brand.")
+    tail = "  \n<small>For this US product — fillers differ between brands and countries; check your pack.</small>"
+    for word, rx in _INGREDIENT_Q:
+        if word in raw or (word == "dyes" and re.search(r"dye|colou?r", raw)):
+            m = rx.search(inact)
+            if m:
+                return _verdict(f"**Yes — this product lists {_md_safe(m.group(0))}** among its "
+                                f"inactive ingredients.{tail}", (inact[:300], "FDA label", of.get("url", "")))
+            return _verdict(f"**Not listed** among this product's inactive ingredients.{tail}",
+                            (inact[:300], "FDA label", of.get("url", "")))
+    if re.search(r"halal|kosher|vegan|vegetarian|animal|pork|porcine|bovine", raw):
+        animal = re.findall(r"gelatin\w*|lactose|carmine|shellac|stearic acid|magnesium stearate", inact, re.I)
+        if animal:
+            return _verdict(f"**Not stated on the label.** This product contains "
+                            f"{_md_safe(', '.join(dict.fromkeys(a.lower() for a in animal)))}, which can be "
+                            f"animal-derived — ask the pharmacist or manufacturer.{tail}")
+        return _verdict(f"**Not stated on the label**, and no commonly animal-derived ingredient is "
+                        f"listed — certification isn't recorded.{tail}")
+    return _verdict("**Inactive ingredients (FDA label):**", (inact[:400], "FDA label", of.get("url", "")))
+
+
+def direct_answer(ctx, name, p) -> List[Dict[str, Any]]:
+    """The 'Short answer' that opens a reply, chosen by the question's form and
+    primary topic. Empty when nothing direct can be said."""
+    intents = p.get("intents") or []
+    primary = intents[0] if intents else ""
+    form = p.get("form") or ""
+    try:
+        if p.get("allergen") and primary == "warnings":
+            return _allergy_verdict(ctx, name, p)
+        if primary == "ingredients":
+            return _ingredients_verdict(ctx, name, p)
+        if primary == "cost":
+            return []                                   # the cost section says it
+        if primary == "interactions" and p.get("interactant"):
+            return _interactant_verdict(ctx, name, p)
+        if primary in ("dosing", "warnings", "interactions", "legal"):
+            lead = _practical_lead(ctx, name, p)
+            if lead:
+                return lead
+        if form == "yes_no":
+            if primary == "side_effects" or (
+                    primary == "mechanism" and set(_question_words(p, name)) & _DIRECTION_WORDS):
+                return _effect_verdict(ctx, name, p)
+            if primary == "interactions" and p.get("interactant"):
+                return _interactant_verdict(ctx, name, p)
+            if primary == "class":
+                return _class_member_verdict(ctx, name, p)
+            if primary == "brands":
+                return _availability_verdict(ctx, name, p)
+            if primary == "legal":
+                return _controlled_verdict(ctx, name, p)
+            if primary == "uses":
+                return _uses_verdict(ctx, name, p)
+            if primary == "pk":
+                return _mention_verdict(ctx, name, p, {"pk", "mechanism", "pregnancy", "overview"}, "")
+            if primary in ("properties", "structure"):
+                return _chem_verdict(ctx, name, p)
+        if primary in ("properties", "structure") and form in ("what", "statement", "which"):
+            return _chem_verdict(ctx, name, p)
+        if primary == "brands" and _RX_Q_RE.search(p.get("raw") or ""):
+            return _availability_verdict(ctx, name, p)
+        if form == "how_long" and primary == "pk":
+            return _duration_lead(ctx, name, p)
+        if form == "how_much" and primary == "dosing":
+            return _dose_lead(ctx, name, p)
+        if form == "how_often" and primary == "dosing":
+            return _pattern_lead(ctx, p, _FREQ_RE, "**How often (label):**", primary=_FREQ_EXPLICIT_RE)
+        if form == "when" and primary == "dosing":
+            return _pattern_lead(ctx, p, _TIMING_RE, "**When to take it:**")
+        if form == "how_common" and primary == "side_effects":
+            return _effect_verdict(ctx, name, p)
+    except Exception:  # noqa: BLE001 — a short answer must never break the reply
+        return []
+    return []
+
+
+def _ans_cost(ctx, name, p):
+    blocks = [_b("info", v=f"I don't have price information for {_md_safe(name)} — prices depend on "
+                           "the brand, pack size, clinic/pharmacy and any subsidy. Ask the pharmacy or "
+                           "your clinic.")]
+    sg = (ctx.get("market") or {}).get("sg")
+    if ctx.get("region") == "SG" and sg and HAS_SG_REGISTER:
+        blocks.append(_b("md", v=f"**Singapore availability:** {_md_safe(sgr.availability_text(sg))} "
+                                 "<small>· HSA register</small>", html=True))
+    return blocks
+
+
+def _ans_ingredients(ctx, name, p):
+    of = ctx.get("label") or {}
+    items = []
+    if of.get("inactive_ingredients"):
+        items.append((f"**Inactive ingredients:** {of['inactive_ingredients'][:600]}", "FDA label",
+                      of.get("url", "")))
+    for head, body, tp in medguide_sections(of.get("medguide") or ""):
+        if tp == "ingredients":
+            items.append((body[:600], "FDA label", of.get("url", "")))
+            break
+    if not items:
+        return [_b("info", v=f"No ingredient list for {_md_safe(name)} in the US label data I have.")]
+    blocks = _pts(items, title="", cap=2)
+    blocks.append(_b("caption", v="From one US product's label — inactive ingredients differ between "
+                                  "brands and countries, so check your own pack."))
+    return blocks
+
+
 _INTENT_BUILDERS = {
     "overview": _ans_overview, "mechanism": _ans_mechanism, "pk": _ans_pk,
     "uses": _ans_uses, "dosing": _ans_dosing, "side_effects": _ans_side_effects,
@@ -6616,6 +7578,7 @@ _INTENT_BUILDERS = {
     "storage": _ans_topic({"storage"}, "Stability & storage", _storage_extra,
                           search_terms=("store", "storage", "stable", "refrigerate"),
                           skip_label=True),
+    "cost": _ans_cost, "ingredients": _ans_ingredients,
     "search": _ans_search,
 }
 
@@ -6636,6 +7599,7 @@ def _intent_heading(intent: str, name: str) -> str:
         "properties": f"Properties of {name}", "spectra": f"Spectra of {name}",
         "history": f"History of {name}", "synthesis": f"How {name} is made",
         "legal": f"{name}: abuse & legal status", "storage": f"Storing {name}",
+        "cost": f"Cost of {name}", "ingredients": f"What's in {name}",
         "search": f"{name}: from the record",
     }
     return f"#### {icon} {_md_safe(titles.get(intent, name))}"
@@ -6681,6 +7645,8 @@ def _answer_for(ctx, entity, p, opts, compact=False) -> List[Dict[str, Any]]:
     name = _chat_name(ctx, entity)
     p = dict(p, _entity=entity, _compact=compact)
     blocks: List[Dict[str, Any]] = []
+    # the direct answer to the question as asked (verdict / duration / dose)
+    blocks += direct_answer(ctx, name, p)
     for intent in p["intents"]:
         fn = _INTENT_BUILDERS.get(intent, _ans_search)
         try:
@@ -6970,10 +7936,25 @@ def _answer_entities(p: Dict[str, Any], opts: Dict[str, Any]
     ents = p["entities"]
     intents = p["intents"]
     level = _level_for(intents)
+    if p.get("same_as"):
+        a, b = p["same_as"][:2]
+        kinds = (list(p["same_as"]) + ["", ""])[2:4]
+        if "brand" in kinds:
+            brand, generic = (a, b) if kinds[0] == "brand" else (b, a)
+            text = (f"**Yes — {_md_safe(brand)} is a brand of {_md_safe(generic)}**, so it's the "
+                    "same active medicine (brands can differ in strength, form and fillers).")
+        else:
+            text = (f"**Yes — {_md_safe(a)} and {_md_safe(b)} are two names for the same medicine** "
+                    "(one is the international/British name, the other the US name).")
+        blocks.append(_b("answer", items=[(text, "", "")], label="Short answer"))
     if p["mode"] == "interaction":
         return _answer_interaction(p, opts, blocks)
     if p["mode"] == "compare" and len(ents) == 2:
         out = _answer_compare(p, opts, blocks)
+        if out is not None:
+            return out
+    if p["mode"] == "relation":
+        out = _answer_relation(p, opts, blocks)
         if out is not None:
             return out
     multi = len(ents) > 1
@@ -7229,6 +8210,176 @@ def _answer_compare(p, opts, blocks):
                     "intents": p["intents"]}
 
 
+# ---- relationship questions: 'why is X the antidote for Y' -----------------
+# Words that make a sentence EXPLAIN a link rather than merely mention it.
+_EXPLAIN_RE = re.compile(
+    r"\b(?:because|due to|by (?:\w+ing)\b|via|through|thereby|bypass\w*|independent(?:ly)? of|"
+    r"mechanism|acts? (?:on|by|as|at)|works? by|lead(?:s|ing)? to|result(?:s|ing)? in|"
+    r"increas\w*|decreas\w*|restor\w*|activat\w*|inhibit\w*|block\w*|bind\w*|receptors?|"
+    r"cAMP|cyclic AMP|second messenger|adenyl\w* cyclase|competitive\w*|antagonis\w*|"
+    r"agonis\w*|displac\w*|counteract\w*|revers\w*|stimulat\w*)\b", re.I)
+# 'Patients taking beta-blockers may have a transient increase…' — an
+# interaction warning, not an explanation of the link.
+_REL_NOISE_RE = re.compile(r"\bpatients (?:taking|on|receiving)\b|\bconcomitant\b|"
+                           r"\bco-?administ\w*|\bclinical impact\b|\bmay have a transient\b", re.I)
+_REL_GENERIC = {"overdose", "overdoses", "overdosage", "toxicity", "poisoning", "toxic",
+                "intoxication", "effect", "effects", "treatment", "therapy", "patients",
+                "type", "the", "of", "and", "in", "with"}
+_REL_QUESTION_CUES = re.compile(r"\b(?:antidote|overdos\w*|toxicity|poisoning|revers\w*|"
+                                r"treat\w*)\b", re.I)
+
+
+def _rel_word_rx(word: str) -> str:
+    """One target word → a tolerant pattern ('beta' also matches 'β', a plural
+    or inflection also matches)."""
+    w = re.escape(word.lower())
+    greek = {"beta": "(?:beta|β)", "alpha": "(?:alpha|α)", "gamma": "(?:gamma|γ)"}
+    if word.lower() in greek:
+        return greek[word.lower()]
+    return w[:-1] + r"\w*" if len(word) > 4 else w + r"\w*"
+
+
+def relation_target_re(target: str) -> Optional[re.Pattern]:
+    """Pattern for the core of a relationship target: 'beta blocker overdose'
+    → 'beta[- ]?(adrenergic )?blocker…' (the generic 'overdose' is dropped — it
+    scores a sentence, but doesn't identify the other side)."""
+    words = [w for w in re.findall(r"[A-Za-z0-9]+", target) if w.lower() not in _REL_GENERIC]
+    if not words:
+        words = re.findall(r"[A-Za-z0-9]+", target)
+    if not words:
+        return None
+    joiner = r"[\s\-]*(?:adrenergic[\s\-]*|receptor[\s\-]*)?"
+    return re.compile(r"\b" + joiner.join(_rel_word_rx(w) for w in words), re.I)
+
+
+def relation_core(target: str) -> str:
+    """'beta blocker overdose' → 'beta blocker' (for looking up its article)."""
+    words = [w for w in target.split() if w.lower() not in _REL_GENERIC]
+    return " ".join(words) or target
+
+
+def score_relation_sentence(text: str, subj_re: Optional[re.Pattern],
+                            tgt_re: re.Pattern, question: str) -> float:
+    """How well a sentence explains the subject↔target link (0 = unusable).
+    Must mention the target; both sides, explanatory wording and the question's
+    own cue words (antidote, overdose…) raise it; interaction warnings sink it."""
+    if not tgt_re.search(text):
+        return 0.0
+    score = 1.0
+    if subj_re is not None and subj_re.search(text):
+        score += 2.0
+    score += min(3, len(_EXPLAIN_RE.findall(text))) * 1.2
+    for cue in set(m.lower()[:6] for m in _REL_QUESTION_CUES.findall(question)):
+        if re.search(re.escape(cue), text, re.I):
+            score += 1.0
+    if _REL_NOISE_RE.search(text):
+        score -= 3.0
+    if len(text) > 400:
+        score -= 1.0
+    return max(score, 0.0)
+
+
+def _wiki_sentences(secs: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """(sentence, section heading) for a whole Wikipedia article."""
+    out = []
+    for heading, text in [("", secs.get("lead", ""))] + \
+            [(s.get("heading", ""), s.get("text", "")) for s in secs.get("sections", [])]:
+        for s in _split_sentences(re.sub(r"\s+", " ", text or "")):
+            if len(s) > 30:
+                out.append((s, heading))
+    return out
+
+
+def relation_evidence(ctx: Dict[str, Any], subject: str, target: str,
+                      question: str) -> List[Tuple[float, str, str, str]]:
+    """Ranked [(score, sentence, source, url)] connecting the subject drug to
+    the target, from the drug's own sources, its full Wikipedia article and
+    the TARGET's Wikipedia article (e.g. 'Beta blocker' → its Overdose
+    section names glucagon)."""
+    tgt_re = relation_target_re(target)
+    if tgt_re is None:
+        return []
+    subj_re = _drug_names_re(ctx) or re.compile(r"\b" + re.escape(subject) + r"\b", re.I)
+    cands: List[Tuple[str, str, str]] = []
+    cands += [(d["text"], d["src"], d.get("url", "")) for d in _chat_corpus(ctx)]
+    secs = ctx.get("wiki_secs") or {}
+    cands += [(s, "Wikipedia", secs.get("url", "")) for s, _h in _wiki_sentences(secs)]
+    # the other side's article: sentences there must name the subject drug
+    core = relation_core(target)
+    other = cached_wiki_sections(core) or {}
+    if other and other.get("title") != secs.get("title"):
+        label = f"Wikipedia: {other.get('title')}"
+        cands += [(s, label, other.get("url", "")) for s, _h in _wiki_sentences(other)
+                  if subj_re.search(s)]
+    scored = []
+    dd = _SentenceDeduper()
+    for text, src, url in cands:
+        # DrugBank/PubChem citation codes glued on: '…pesticides.L42815,​L42835'
+        text = re.sub(r"\.?\s*\b[LA]\d{4,6}(?:[,\s​]+[LA]\d{4,6})*\s*$", ".", text).strip()
+        sc = score_relation_sentence(text, subj_re, tgt_re, question)
+        if sc <= 0:
+            continue
+        scored.append((sc, text, src, url))
+    scored.sort(key=lambda x: -x[0])
+    out = []
+    for sc, text, src, url in scored:
+        ws = _content_words(text)
+        if dd.is_dup(ws) or dd.is_restatement(ws):
+            continue
+        dd.accept(ws)
+        out.append((sc, text, src, url))
+    return out
+
+
+def _answer_relation(p, opts, blocks):
+    """'why is glucagon the antidote for beta-blocker overdose' → the sentences
+    in the sources that explain the link (best first), then how the drug works.
+    No reasoning engine: it finds where the sources make the connection."""
+    en = p["entities"][0]
+    target = p.get("relation_target") or ""
+    loaded = _chat_load(en, opts, "full", extras=False)
+    if loaded.get("offline") or loaded.get("error"):
+        return None
+    ctx = loaded["ctx"]
+    name = _chat_name(ctx, en)
+    blocks += loaded["notes"]
+    _progress(opts, f"Looking for where the sources connect {name} and {target}…")
+    ev = relation_evidence(ctx, name, target, p.get("raw") or "")
+    blocks.append(_b("md", v=f"#### 🔗 {_md_safe(name)} ↔ {_md_safe(target)}"))
+    strong = [e for e in ev if e[0] >= 3.0]
+    if strong:
+        blocks += _answer_box([(t, s, u) for _sc, t, s, u in strong[:2]],
+                              label="What the sources say about the link")
+        blocks += _pts([(t, s, u) for _sc, t, s, u in strong[2:5]],
+                       title="More from the sources", cap=2, more="More")
+    elif ev:
+        blocks.append(_b("info", v=f"The sources mention {_md_safe(name)} and "
+                                   f"{_md_safe(target)} together but don't explain the link:"))
+        blocks += _pts([(t, s, u) for _sc, t, s, u in ev[:3]], cap=3)
+    else:
+        blocks.append(_b("info", v=f"None of {_md_safe(name)}'s sources (FDA label, PubChem, "
+                                   f"ChEMBL, Wikipedia) mention {_md_safe(target)} — so there's "
+                                   "nothing to quote. How it works is below; a pharmacist or a "
+                                   "pharmacology text can explain the connection."))
+    # how the drug works — the other half of most 'why' answers
+    _h, val, _scope = _find_heading(ctx, "mechanism")
+    kp = (val or {}).get("key_points") if isinstance(val, dict) else None
+    mech = list(kp or []) or [(t, "ChEMBL", (ctx.get("clin_chembl") or {}).get("url", ""))
+                              for t, _tgt, _act in _chembl_mechs(ctx)]
+    if mech:
+        blocks += _pts(mech[:3], title=f"How {name} works", cap=3)
+    blocks.append(_b("caption", v="Ask doesn't reason — it finds the sentences in the sources "
+                                  "that connect the two and ranks the ones that explain *how* "
+                                  "first. Follow the source tags to read them in context."))
+    ref = _entity_ref(en, ctx)
+    blocks.append(_b("buttons", title="Ask next",
+                     items=[("🧬 How it works", f"How does {ref} work?"),
+                            ("⚠️ Side effects", f"Side effects of {ref}"),
+                            ("📖 Full profile", _PROFILE_PREFIX + loaded["query"])]))
+    return blocks, {"entity": {"kind": "free", "query": loaded["query"], "display": ref},
+                    "intents": p.get("intents") or ["overview"]}
+
+
 def _answer_interaction(p, opts, blocks) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     a, b = p["entities"][0], p["entities"][1]
     la = _chat_load(a, opts, "full", extras=False)
@@ -7340,19 +8491,67 @@ def _answer_condition(p, opts) -> List[Dict[str, Any]]:
     return blocks
 
 
+def _crisis_blocks(opts: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Self-harm wording: support first, never toxicity or doses."""
+    us = opts.get("region") == "US"
+    lines = ("- **US:** call or text **988** (Suicide & Crisis Lifeline) · emergency **911**\n"
+             if us else
+             "- **Singapore:** Samaritans of Singapore (SOS) 24-hour hotline **1767** "
+             "(WhatsApp 9151 1767) · IMH Mental Health Helpline **6389 2222** · emergency **995**\n")
+    return [
+        _b("error", v="💛 **It sounds like you might be going through something really hard.** You "
+                      "don't have to face it alone — please reach out to someone now."),
+        _b("md", v=lines + "- **Anywhere else:** your local emergency number, or find a free, "
+                           "confidential helpline at [findahelpline.com](https://findahelpline.com)"),
+        _b("md", v="**If you or someone else has already taken too much of a medicine, call "
+                   + ("911" if us else "995") + " now.**"),
+        _b("caption", v="This assistant won't give information that could be used for self-harm."),
+    ]
+
+
+def _refuse_blocks() -> List[Dict[str, Any]]:
+    return [
+        _b("warning", v="I can't help with making or extracting drugs outside a licensed setting — "
+                        "it's illegal and dangerous (toxic reagents, contamination, unknown doses)."),
+        _b("md", v="I can explain what a drug is, how it works, its effects and risks, or how "
+                   "addiction and withdrawal are treated. In Singapore, the National Addictions "
+                   "Management Service (NAMS) helpline is **6732 6837**."),
+    ]
+
+
+def _pet_blocks(p: Dict[str, Any]) -> List[Dict[str, Any]]:
+    blocks = []
+    if p.get("urgent"):
+        blocks.append(_b("error", v="🐾 **If your pet has eaten a medicine, contact a vet or an "
+                                    "animal emergency clinic now** — bring the pack with you."))
+    blocks.append(_b("info", v="This assistant covers **human** medicines. Doses and safety are very "
+                               "different in animals, and many human medicines are dangerous to "
+                               "pets — please don't give one without a vet's advice."))
+    return blocks
+
+
 def _help_blocks() -> List[Dict[str, Any]]:
     return [
         _b("md", v="Ask me about any medicine or chemical in plain English. I match your "
                    "question against FDA labels, ChEMBL, PubChem, Wikipedia and the HSA "
                    "register and show the relevant part — there's no AI model, so nothing is "
                    "invented and every line shows its source."),
-        _b("md", v="- **How it works** — *how does codeine work?*, *semaglutide pharmacodynamics*\n"
-                   "- **Side effects & safety** — *does metformin cause weight gain?*, *is "
-                   "paracetamol safe in pregnancy?*\n"
-                   "- **Dosing, half-life, interactions** — *ibuprofen dosage for kids*, *half-life "
-                   "of diazepam*, *can I take ibuprofen with warfarin?*\n"
+        _b("md", v="- **Yes/no questions get a straight answer first** — *does metformin cause weight "
+                   "gain?*, *is ibuprofen an NSAID?*, *do I need a prescription for amoxicillin?*, *is "
+                   "codeine addictive?*\n"
+                   "- **How it works** — *how does codeine work?*, *semaglutide pharmacodynamics*\n"
+                   "- **Side effects & safety** — *is paracetamol safe in pregnancy?*, *can I drive on "
+                   "diazepam?*, *I'm allergic to penicillin — can I take amoxicillin?*\n"
+                   "- **Dosing & taking it** — *max dose of paracetamol*, *how often can I take "
+                   "ibuprofen?*, *what if I miss a dose?*, *can I crush it?*, *with food?*\n"
+                   "- **Half-life, interactions** — *how long does diazepam stay in my system?*, *can I "
+                   "drink alcohol on metronidazole?*, *can I take ibuprofen with warfarin?*\n"
                    "- **Chemistry** — *structure of codeine*, *pKa of aspirin*, *3D structure of "
                    "caffeine*\n"
+                   "- **Why / how questions** — *why is glucagon the antidote for beta-blocker "
+                   "overdose?*, *how does naloxone reverse morphine?* (finds where the sources "
+                   "explain the link)\n"
+                   "- **Compare** — *metoprolol vs propranolol*\n"
                    "- **Brands & classes** — *brands of atorvastatin in Singapore*, *what are "
                    "statins?*, *what can I take for heartburn?*\n"
                    "- **Follow-ups** — *what about its half-life?*, *and morphine?*"),
@@ -7378,6 +8577,12 @@ def chat_respond(text: str, opts: Dict[str, Any]) -> Dict[str, Any]:
             blocks = _help_blocks()
         elif mode == "thanks":
             blocks = [_b("md", v="You're welcome! Ask me anything else about a medicine or chemical.")]
+        elif mode == "crisis":
+            blocks = _crisis_blocks(opts)
+        elif mode == "refuse":
+            blocks = _refuse_blocks()
+        elif mode == "pets":
+            blocks = _pet_blocks(p)
         elif mode == "class_list":
             blocks = _answer_class_list(p)
         elif mode == "condition":
