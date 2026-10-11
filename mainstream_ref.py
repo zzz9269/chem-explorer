@@ -102,13 +102,24 @@ def search(query: str, rows=None) -> list:
     return [e for _, _, e in sorted(hits, key=lambda h: h[:2])]
 
 
-def find_entry(*names: str):
-    """The reference row naming any of `names` as one of its drugs, if any."""
-    wanted = {n.casefold().strip() for n in names if n}
+def find_entries(*names: str) -> list:
+    """Every reference row naming any of `names` as one of its drugs — by its
+    British name, the US name in brackets, or the lead drug of a "with" combo
+    (aspirin has an analgesic row and a low-dose antiplatelet row)."""
+    wanted = {n.casefold().strip() for n in names if n and n.strip()}
+    hits = []
     for e in entries():
         for part in _split_top_level(e["drug"]):
             bare = re.sub(r"\([^)]*\)", "", part).strip().casefold()
-            alt = re.findall(r"\(([^)]*)\)", part)
-            if bare in wanted or any(a.strip().casefold() in wanted for a in alt):
-                return e
-    return None
+            lead = re.split(r"\s+with\b", bare)[0].strip()
+            alt = [a.strip().casefold() for a in re.findall(r"\(([^)]*)\)", part)]
+            if bare in wanted or lead in wanted or any(a in wanted for a in alt):
+                hits.append(e)
+                break
+    return hits
+
+
+def find_entry(*names: str):
+    """The first reference row naming any of `names`, if any."""
+    hits = find_entries(*names)
+    return hits[0] if hits else None

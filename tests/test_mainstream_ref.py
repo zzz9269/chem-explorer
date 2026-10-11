@@ -53,6 +53,32 @@ def test_us_name_finds_the_british_entry():
     assert mref.find_entry("acetaminophen")["drug"] == "Paracetamol (acetaminophen)"
 
 
+def test_drug_in_two_rows_finds_both():
+    assert [e["drug"] for e in mref.find_entries("aspirin")] == \
+        ["Aspirin (acetylsalicylic acid)", "Aspirin (low dose)"]
+
+
+def _card_page():
+    import streamlit as st
+    import chem_v4 as v
+    q = st.session_state.get("q", "Aspirin")
+    v.render_reference_card(q, None, q)
+
+
+@pytest.mark.parametrize("name, label", [
+    ("Acetaminophen", "Central analgesic and antipyretic"),   # US name → British row
+    ("Metformin hydrochloride", "Biguanide"),                 # salt stripped
+    ("Water", None),                                          # not in the reference
+])
+def test_reference_card_on_the_drug_page(name, label):
+    at = AppTest.from_function(_card_page, default_timeout=120)
+    at.session_state["q"] = name
+    at.run()
+    assert not at.exception
+    labels = [e.label for e in at.expander]
+    assert labels == ([f"📘 In your Mainstream Drug Reference — {label}"] if label else [])
+
+
 def test_search_ranks_name_matches_first():
     hits = mref.search("tramadol")
     assert hits[0]["drug"] == "Tramadol"

@@ -3576,7 +3576,8 @@ def render_mainstream_reference():
     c1, c2 = st.columns([2, 3])
     with c1:
         sec_names = [_REF_ALL] + [f"{s['no']}. {s['title']}" for s in secs]
-        sec_pick = st.selectbox("Section", sec_names, index=1, key="ref_section")
+        st.session_state.setdefault("ref_section", sec_names[1])
+        sec_pick = st.selectbox("Section", sec_names, key="ref_section")
     with c2:
         query = st.text_input("Search the reference", key="ref_search",
                               placeholder="e.g. serotonin syndrome, CYP2D6, "
@@ -3690,6 +3691,43 @@ def render_drug_class_banner(*names: Optional[str]):
             help=f"{sys_tag}: browse other {dl.class_name(slug)} in the Drug Library")
     if extra:
         st.caption("Also: " + ", ".join(dl.class_name(s) for s in extra))
+
+
+def _focus_reference(e: Dict):
+    """Jump to the Reference mode showing this row's section, filtered to it."""
+    st.session_state["app_mode"] = _MODE_REFERENCE
+    st.session_state["ref_section"] = f"{e['section_no']}. {e['section']}"
+    st.session_state["ref_search"] = mref.drug_links(e)[0][1] or ""
+    st.session_state["ref_tags"] = []
+    st.session_state["ref_view"] = "Cards"
+
+
+def render_reference_card(*names: Optional[str]):
+    """The user's own Mainstream Drug Reference notes for this drug, if it's in
+    there — matched by British name, US name in brackets, or salt-stripped name."""
+    if not HAS_MAINSTREAM_REF:
+        return
+    lib = find_library_drug(*names)
+    cands = [c for n in names if n for c in (n, _SALT_SUFFIX_RE.sub("", n))]
+    if lib:
+        cands.append(lib["name"])
+    hits = mref.find_entries(*cands)
+    if not hits:
+        return
+    with st.expander(f"📘 In your Mainstream Drug Reference — {hits[0]['class']}",
+                     expanded=True):
+        for i, e in enumerate(hits):
+            if i:
+                st.divider()
+            badge = _REF_TAG_BADGE.get(e["tag"], "")
+            st.markdown(f"**{e['drug']}** {badge}  \n"
+                        f":gray[{e['section']} › {e['subsection']} · {e['class']}]")
+            c1, c2, c3 = st.columns(3)
+            c1.markdown(f"**Mechanism**  \n{e['mechanism']}")
+            c2.markdown(f"**Main uses**  \n{e['uses']}")
+            c3.markdown(f"**Key cautions & signature effects**  \n{e['cautions']}")
+            st.button("See it in the Reference ›", key=f"ref_back_{e['id']}",
+                      type="tertiary", on_click=_focus_reference, args=(e,))
 
 
 # ---------------------- Data pipeline (no rendering) ----------------------
@@ -4378,6 +4416,7 @@ def render_full_profile(ctx: Dict[str, Any], *, show_atoms: bool = False,
             this_compound_caption(compound_name, cid)
         # Cross-link to the Drug Library if this compound is a known medicine.
         render_drug_class_banner(compound_name, resolved_name, input_text)
+        render_reference_card(input_text, resolved_name, compound_name)
         # One best summary up front; the other sources' descriptions sit behind
         # an expander rather than stacking three overlapping summaries.
         any_primary = render_summaries(wiki, record_text, wikidata, cid, compact=True)
