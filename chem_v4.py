@@ -6482,10 +6482,19 @@ def _ans_brands(ctx, name, p):
         if sg:
             blocks.append(_b("md", v=f"**Brands in Singapore:** {_md_safe(', '.join(sg['brands'][:15]))}"))
             blocks.append(_b("md", v=f"**Availability (HSA):** {_md_safe(sgr.availability_text(sg))}"))
+            # every registered product (the table scrolls); combination products
+            # are marked, since the class counts above cover single-ingredient ones
             rows = [{"Class": x["cls"], "Product": x["name"], "Strength": x.get("strength", ""),
-                     "Form": (x.get("form") or "").title()} for x in sg["products"][:12]]
+                     "Form": (x.get("form") or "").title(),
+                     "Type": "Combination" if len(x.get("ings") or []) > 1 else "Single"}
+                    for x in sg["products"]]
             if rows:
                 blocks.append(_b("table", rows=rows))
+                n_combo = sum(r["Type"] == "Combination" for r in rows)
+                if n_combo and not sg.get("combination_only"):
+                    blocks.append(_b("caption", v=f"{len(rows)} products in total — the counts above are "
+                                                  f"for the {len(rows) - n_combo} single-ingredient ones; "
+                                                  f"{n_combo} combination product(s) also contain it."))
             blocks.append(_b("caption", v="POM = prescription-only · P = pharmacy-only · GSL = "
                                           "general sale. From the HSA Listing of Registered "
                                           "Therapeutic Products (data.gov.sg, Singapore Open Data "
