@@ -1,0 +1,20 @@
+# Drug & Chemical Explorer — Python dependencies
+# Install with:  pip install -r requirements.txt
+# Versions: lower bounds are the ones the app is tested with.
+
+# Core app
+streamlit>=1.50,<2      # width='stretch' / st.pills need 1.50
+pubchempy>=1.0.4
+rdkit>=2025.3           # cheminformatics (parsing, descriptors, 2D/3D)
+py3Dmol>=2.0            # interactive 3D viewer
+requests>=2.28          # PubChem / openFDA / ChEMBL / Wikipedia HTTP
+pandas>=2.0
+pillow>=10.0            # 2D image handling / PNG export
+bleach>=6.0             # sanitize PubChem HTML fragments
+altair>=5.0             # charts (FAERS, drug-likeness, charge vs pH)
+
+# Structure drawing (optional but recommended — returns SMILES directly)
+streamlit-ketcher>=0.0.1
+
+# Not needed when deployed: py2opsin (local OPSIN) requires Java; the app falls
+# back to the OPSIN web service automatically. Install it locally if you have Java.
