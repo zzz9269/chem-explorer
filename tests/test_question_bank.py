@@ -149,6 +149,23 @@ def test_slang_is_expanded():
     assert "IM" in cr.expand_shorthand("given IM")                          # intramuscular
 
 
+def test_every_showcase_example_is_understood():
+    # the examples shown to users must themselves work — never teach a dud
+    for cat, qs in qb.load()["showcase"].items():
+        for q in qs:
+            p = cr.parse_query(q)
+            assert p["mode"] not in ("unknown", "clarify", "multi"), (cat, q, p["mode"])
+            if p["mode"] == "answer":
+                assert p["intents"][0] != "search", (cat, q, p["intents"])
+
+
+def test_suggestions_fill_in_the_drug():
+    qs = qb.suggestions_for("metformin", 3, skip_topics=("uses",))
+    assert len(qs) == 3 and all("metformin" in q for q in qs)
+    assert not any("used for" in q for q in qs)
+    assert len(set(qb.showcase(6, seed=1))) == 6
+
+
 # ------------------------------------------------------------- question form
 @pytest.mark.parametrize("q,form", [
     ("does drugx cause weight gain", "yes_no"), ("is drugx safe in pregnancy", "yes_no"),

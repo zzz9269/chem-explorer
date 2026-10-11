@@ -6680,9 +6680,12 @@ def _ans_search(ctx, name, p):
     match them — or, when nothing matches, the overview."""
     rel = _relevant(ctx, p.get("focus") or [], k=6)
     if rel:
-        return _pts(rel, title=f"Most relevant to “{_focus_label(p)}”", cap=6)
-    return ([_b("caption", v=f"Nothing in {name}'s record matched “{_md_safe(_focus_label(p))}” "
-                             "— here's the overview instead.")] + _ans_overview(ctx, name, p))
+        # matched words, not a recognised question — offer clearer phrasings
+        return (_pts(rel, title=f"Most relevant to “{_focus_label(p)}”", cap=6)
+                + _suggest_blocks(name, title="Not quite it? Try asking:"))
+    return ([_b("caption", v=f"I wasn't sure what you wanted to know about {name} — here's the "
+                             "overview. Tap a question below to ask something specific.")]
+            + _ans_overview(ctx, name, p) + _suggest_blocks(name, skip_topics=("overview",)))
 
 
 # =========================== Short answers ===================================
@@ -7628,6 +7631,8 @@ def _fallback_blocks(ctx, name, p, intent) -> List[Dict[str, Any]]:
         msg = f"I couldn't find {title} information for {name} in the sources I use."
     blocks = [_b("info", v=msg)]
     blocks += _pts(rel, title="Closest matches in the record", cap=4)
+    if _is_med(ctx):
+        blocks += _suggest_blocks(name, skip_topics=(intent,), title="Other things I can tell you:")
     return blocks
 
 
@@ -7981,6 +7986,9 @@ def _answer_entities(p: Dict[str, Any], opts: Dict[str, Any]
             if sugg:
                 blocks.append(_b("buttons", title="Did you mean:",
                                  items=[(s, _replace_entity(p["raw"], en, s)) for s in sugg[:4]]))
+            else:
+                blocks.append(_b("buttons", title="Questions I can answer, for example:",
+                                 items=[(q, q) for q in _examples(4)]))
             continue
         ctx = loaded["ctx"]
         blocks += loaded["notes"]
@@ -8539,6 +8547,33 @@ def _pet_blocks(p: Dict[str, Any]) -> List[Dict[str, Any]]:
     return blocks
 
 
+def _examples(k: int = 6) -> List[str]:
+    """Example questions from the question bank, one per category — stable
+    within a session (so buttons don't jump on every rerun) until reshuffled."""
+    qbm = getattr(cr, "_qb", None) if cr else None
+    if qbm is None:
+        return _CHAT_EXAMPLES[:k]
+    seed = st.session_state.setdefault("showcase_seed", int(time.time()) % 100000)
+    try:
+        return qbm.showcase(k, seed) or _CHAT_EXAMPLES[:k]
+    except Exception:  # noqa: BLE001
+        return _CHAT_EXAMPLES[:k]
+
+
+def _reshuffle_examples():
+    st.session_state["showcase_seed"] = st.session_state.get("showcase_seed", 0) + 1
+
+
+def _suggest_blocks(name: str, skip_topics=(), title: str = "Try asking:") -> List[Dict[str, Any]]:
+    """Ready-made questions about this drug — shown when a question wasn't
+    understood, so the user can rephrase with one tap."""
+    qbm = getattr(cr, "_qb", None) if cr else None
+    if qbm is None or not name:
+        return []
+    qs = qbm.suggestions_for(name, 3, skip_topics)
+    return [_b("buttons", title=title, items=[(q, q) for q in qs])] if qs else []
+
+
 def _help_blocks() -> List[Dict[str, Any]]:
     return [
         _b("md", v="Ask me about any medicine or chemical in plain English. I match your "
@@ -8564,7 +8599,7 @@ def _help_blocks() -> List[Dict[str, Any]]:
                    "- **Brands & classes** — *brands of atorvastatin in Singapore*, *what are "
                    "statins?*, *what can I take for heartburn?*\n"
                    "- **Follow-ups** — *what about its half-life?*, *and morphine?*"),
-        _b("buttons", title="Try:", items=[(q, q) for q in _CHAT_EXAMPLES[:4]]),
+        _b("buttons", title="Try:", items=[(q, q) for q in _examples(6)]),
     ]
 
 
@@ -8611,7 +8646,8 @@ def chat_respond(text: str, opts: Dict[str, Any]) -> Dict[str, Any]:
             if p.get("suggestions"):
                 blocks.append(_b("buttons", title="Did you mean:",
                                  items=[(s, f"What is {s}?") for s in p["suggestions"][:4]]))
-            blocks.append(_b("buttons", title="Or try:", items=[(q, q) for q in _CHAT_EXAMPLES[:4]]))
+            blocks.append(_b("buttons", title="Questions I can answer, for example:",
+                             items=[(q, q) for q in _examples(4)]))
         else:
             blocks, new_ctx = _answer_entities(p, opts)
         if new_ctx:
@@ -8655,7 +8691,9 @@ def render_chat(opts: Dict[str, Any]):
         with st.chat_message("assistant", avatar="💊"):
             st.markdown("Hi! Ask me about a medicine or chemical — what it does, how it works, "
                         "side effects, dosing, interactions, structure or properties.")
-            render_blocks([_b("buttons", items=[(q, q) for q in _CHAT_EXAMPLES])], "welcome")
+            render_blocks([_b("buttons", title="Try one — or ask in your own words:",
+                              items=[(q, q) for q in _examples(6)])], "welcome")
+            st.button("🔀 Show other examples", key="reshuffle_examples", on_click=_reshuffle_examples)
             st.caption("Answers are quoted from FDA labels, ChEMBL, PubChem, Wikipedia and the "
                        "HSA register — rule-based matching, no AI. For information only; not "
                        "medical advice.")

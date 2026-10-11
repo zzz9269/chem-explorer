@@ -66,6 +66,59 @@
           "cat"
       ]
   },
+  "showcase": {
+      "Yes/no": [
+          "Does metformin cause weight gain?",
+          "Is ibuprofen an NSAID?",
+          "Is codeine addictive?",
+          "Does cetirizine make you sleepy?",
+          "Can amoxicillin cause diarrhoea?"
+      ],
+      "Dosing": [
+          "What is the maximum dose of paracetamol per day?",
+          "How often can I take ibuprofen?",
+          "What if I miss a dose of sertraline?",
+          "Should I take simvastatin at night?",
+          "Can I crush metformin tablets?"
+      ],
+      "Interactions": [
+          "Can I take ibuprofen with warfarin?",
+          "Can I drink alcohol on metronidazole?",
+          "Does grapefruit interact with atorvastatin?"
+      ],
+      "Safety": [
+          "Is paracetamol safe in pregnancy?",
+          "Can I drive after taking diazepam?",
+          "I'm allergic to penicillin — can I take amoxicillin?",
+          "Who should not take aspirin?"
+      ],
+      "In the body": [
+          "How long does diazepam stay in your system?",
+          "How long does sertraline take to work?",
+          "How is codeine metabolised?"
+      ],
+      "Why / how": [
+          "How does metformin work?",
+          "Why is glucagon the antidote for beta-blocker overdose?",
+          "Why does lisinopril cause a dry cough?"
+      ],
+      "Singapore": [
+          "Do I need a prescription for amoxicillin?",
+          "Brands of atorvastatin in Singapore",
+          "Is Panadol over the counter?"
+      ],
+      "Compare & find": [
+          "Ibuprofen vs paracetamol",
+          "What can I take for heartburn?",
+          "What are statins?",
+          "Alternatives to ibuprofen"
+      ],
+      "Chemistry": [
+          "Structure of caffeine",
+          "Is aspirin acidic?",
+          "Is ibuprofen chiral?"
+      ]
+  },
   "types": [
     {"id": "overview.what_is", "category": "Identity & overview", "form": ["what", "statement"],
      "expect": {"mode": "answer", "topics": ["overview", "mechanism"]},

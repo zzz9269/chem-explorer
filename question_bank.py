@@ -139,6 +139,89 @@ def form_ok(actual: str, expected: List[str]) -> bool:
     return actual in DESCRIPTIVE and any(e in DESCRIPTIVE for e in expected)
 
 
+# ---------------------------------------------------------------------------
+# Example phrasings shown to users (welcome screen, help, 'try asking…')
+# ---------------------------------------------------------------------------
+# Types worth showing off, one category each; skipped: safety/meta/scope types.
+_SHOWCASE_SKIP = ("safety.", "meta.", "scope.", "identity.", "overdose.emergency", "spectra.",
+                  "identifiers.")
+# everyday medicines for examples (types with their own drug slots keep them)
+SHOWCASE_DRUGS = ["paracetamol", "ibuprofen", "metformin", "sertraline", "amoxicillin", "cetirizine",
+                  "omeprazole", "atorvastatin", "amlodipine", "loratadine", "salbutamol", "warfarin"]
+# The most useful questions about one drug, in suggestion order.
+_SUGGEST_ORDER = ["uses.what_for", "side_effects.list", "mechanism.how_works", "dosing.usual",
+                  "interactions.list", "pregnancy.pregnant", "pk.half_life", "warnings.contraindications",
+                  "brands.prescription", "dosing.missed"]
+
+
+def _nice(ex: str) -> bool:
+    """A full, natural question (not a bare keyword query)."""
+    return (len(ex) >= 18 and " " in ex.strip()
+            and re.match(r"(?:what|how|is|are|does|do|can|why|when|should|which|who|will|i)\b", ex))
+
+
+def _sentence(q: str) -> str:
+    q = re.sub(r"\bi\b", "I", q.strip())
+    q = re.sub(r"\bi'm\b", "I'm", q)
+    q = q[:1].upper() + q[1:]
+    if re.match(r"(?:What|How|Is|Are|Does|Do|Can|Why|When|Should|Which|Who|Will)\b", q) and not q.endswith("?"):
+        q += "?"
+    return q
+
+
+def showcase(k: int = 6, seed: Optional[int] = None) -> List[str]:
+    """k example questions from k different categories (random, reproducible
+    with a seed) — shows the RANGE of what can be asked."""
+    import random
+    rnd = random.Random(seed)
+    curated = load().get("showcase") or {}
+    if curated:
+        # hand-picked, realistic questions (generated ones can pair a drug with
+        # a question that makes no sense for it)
+        cats = list(curated)
+        rnd.shuffle(cats)
+        return [rnd.choice(curated[c]) for c in cats[:k] if curated[c]]
+    by_cat: Dict[str, List[Dict]] = {}
+    for t in types():
+        if t["id"].startswith(_SHOWCASE_SKIP):
+            continue
+        by_cat.setdefault(t.get("category", "Other"), []).append(t)
+    cats = list(by_cat)
+    rnd.shuffle(cats)
+    out = []
+    for cat in cats[:k]:
+        t = rnd.choice(by_cat[cat])
+        exs = [e for e in examples(t) if _nice(e)] or examples(t)
+        slots = slots_for(t)
+        if "drug" not in (t.get("slots") or {}):
+            pool = list(SHOWCASE_DRUGS)
+            rnd.shuffle(pool)
+            slots = dict(slots, drug=pool[:3])
+            if "drug2" not in (t.get("slots") or {}):
+                slots["drug2"] = pool[3:6]          # never 'X vs X'
+        n = max((len(v) for v in slots.values()), default=1)
+        out.append(_sentence(instantiate(rnd.choice(exs), slots, rnd.randrange(n))))
+    return out
+
+
+def suggestions_for(drug: str, k: int = 3, skip_topics=()) -> List[str]:
+    """k ready-made questions about one drug ('What is metformin used for?'),
+    for when a question wasn't understood. `skip_topics` avoids repeating the
+    topic just answered."""
+    out = []
+    for tid in _SUGGEST_ORDER:
+        t = type_by_id(tid)
+        if not t or set((t.get("expect") or {}).get("topics") or []) & set(skip_topics):
+            continue
+        ex = next((e for e in examples(t) if _nice(e) and "{drug}" in e
+                   and not re.search(r"\{(?!drug\})\w+\}", e)), None)
+        if ex:
+            out.append(_sentence(ex.replace("{drug}", drug)))
+        if len(out) >= k:
+            break
+    return out
+
+
 def coverage_summary() -> Dict[str, int]:
     """{category: number of question types} — for docs/README."""
     out: Dict[str, int] = {}
