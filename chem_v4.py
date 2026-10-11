@@ -59,6 +59,15 @@ except Exception:
     dl = None
     HAS_DRUG_LIBRARY = False
 
+# The user's own Mainstream Drug Reference (parsed from their PDF) — a study table
+# of ~700 everyday drugs; each name opens that drug's Explore page.
+try:
+    import mainstream_ref as mref
+    HAS_MAINSTREAM_REF = mref.is_available()
+except Exception:
+    mref = None
+    HAS_MAINSTREAM_REF = False
+
 # Singapore HSA register snapshot (no Streamlit, no network) — local brands and
 # POM / Pharmacy-only / General-sale status, used when the market is Singapore.
 try:
@@ -3481,6 +3490,141 @@ def render_drug_library():
         _render_drug_row(d, key_prefix=slug)
 
 
+# ---------------------- Mainstream Drug Reference ----------------------
+_REF_ALL = "All sections"
+_REF_TAG_BADGE = {"both": ":green-badge[WHO + Top-300]",
+                  "who": ":blue-badge[WHO essential]",
+                  "top300": ":orange-badge[Top-300]"}
+_REF_RESULT_CAP = 60
+
+
+def _ref_drug_buttons(e: Dict, key_prefix: str):
+    """One button per drug named in the row (grouped rows like 'Enalapril /
+    perindopril' get one each); names that aren't a single compound — vaccines,
+    mixtures — show as plain bold text."""
+    with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+        for i, (label, q) in enumerate(mref.drug_links(e)):
+            if q:
+                st.button(f"{label} ›", key=f"ref_{key_prefix}_{e['id']}_{i}",
+                          on_click=_open_drug, args=(q,),
+                          help=f"Open {q} in the Explorer")
+            else:
+                st.markdown(f"**{label}**")
+        if e.get("tag"):
+            st.markdown(_REF_TAG_BADGE[e["tag"]])
+
+
+def _render_ref_card(e: Dict, key_prefix: str):
+    with st.container(border=True):
+        _ref_drug_buttons(e, key_prefix)
+        st.caption(e["class"])
+        c1, c2, c3 = st.columns(3)
+        c1.markdown(f"**Mechanism**  \n{e['mechanism']}")
+        c2.markdown(f"**Main uses**  \n{e['uses']}")
+        c3.markdown(f"**Key cautions & signature effects**  \n{e['cautions']}")
+
+
+def _ref_table_select(rows: List[Dict], key: str):
+    """Table-view row click: a row naming one drug opens it straight away;
+    a grouped row is left selected so the picker below can offer each drug."""
+    sel = st.session_state.get(key)
+    picked = sel.selection.rows if sel is not None else []
+    if picked:
+        links = [q for _, q in mref.drug_links(rows[picked[0]]) if q]
+        if len(links) == 1:
+            _open_drug(links[0])
+
+
+def _render_ref_table(rows: List[Dict], key: str):
+    df = pd.DataFrame([{
+        "Drug": e["drug"],
+        "List": mref.TAG_LABELS.get(e["tag"], ""),
+        "Class": e["class"],
+        "Mechanism": e["mechanism"],
+        "Main uses": e["uses"],
+        "Key cautions": e["cautions"],
+        "Sub-section": e["subsection"],
+    } for e in rows])
+    st.dataframe(
+        df, key=key, hide_index=True, on_select=lambda: _ref_table_select(rows, key),
+        selection_mode="single-row", width="stretch", height=min(700, 38 + 35 * len(df)),
+        column_config={c: st.column_config.TextColumn(c, width="large")
+                       for c in ("Mechanism", "Main uses", "Key cautions")})
+    sel = st.session_state.get(key)
+    picked = sel.selection.rows if sel is not None else []
+    if picked:
+        e = rows[picked[0]]
+        st.caption("Open which drug from this row?")
+        _ref_drug_buttons(e, "tblpick")
+
+
+def render_mainstream_reference():
+    """The user's Mainstream Drug Reference as a browsable study table: filter by
+    section / list / text, then click any drug to open its full Explore page."""
+    if not HAS_MAINSTREAM_REF:
+        st.error("Reference data not found. Generate it once with:\n\n"
+                 "`python build_mainstream_reference.py`")
+        return
+    secs = mref.sections()
+    all_rows = mref.entries()
+    st.header("📘 Mainstream Drug Reference")
+    st.caption(f"{len(all_rows)} entries · {len(secs)} sections · "
+               f"{sum(len(s['subsections']) for s in secs)} drug classes — from your "
+               f"*{mref.source()}*. Educational summary only, no doses. "
+               "Click a drug to open its full page.")
+
+    c1, c2 = st.columns([2, 3])
+    with c1:
+        sec_names = [_REF_ALL] + [f"{s['no']}. {s['title']}" for s in secs]
+        sec_pick = st.selectbox("Section", sec_names, index=1, key="ref_section")
+    with c2:
+        query = st.text_input("Search the reference", key="ref_search",
+                              placeholder="e.g. serotonin syndrome, CYP2D6, "
+                                          "beta-blocker, gout…")
+    c3, c4 = st.columns([3, 1])
+    with c3:
+        tags = st.pills("On list", list(mref.TAG_LABELS), selection_mode="multi",
+                        format_func=mref.TAG_LABELS.get, key="ref_tags")
+    with c4:
+        view = st.radio("View", ["Cards", "Table"], key="ref_view", horizontal=True)
+
+    rows = all_rows
+    if sec_pick != _REF_ALL:
+        no = int(sec_pick.split(".", 1)[0])
+        rows = [e for e in rows if e["section_no"] == no]
+    if tags:
+        # "both" rows are on each list, so they satisfy either single-list filter
+        want = set(tags) | ({"both"} if tags else set())
+        rows = [e for e in rows if e["tag"] in want]
+    if query.strip():
+        rows = mref.search(query, rows)
+    elif sec_pick == _REF_ALL:
+        st.info("Pick a section, or search to look across the whole reference.")
+        return
+
+    if not rows:
+        st.info("Nothing matched — try fewer words or another section.")
+        return
+    shown = rows[:_REF_RESULT_CAP] if query.strip() else rows
+    more = f" (showing first {len(shown)})" if len(shown) < len(rows) else ""
+    st.markdown(f"**{len(rows)}** entr{'ies' if len(rows) != 1 else 'y'}{more}")
+
+    if view == "Table":
+        _render_ref_table(shown, key=f"ref_tbl_{sec_pick}_{query}_{'-'.join(tags)}")
+        return
+    if query.strip():                     # search results: flat, best match first
+        for e in shown:
+            st.caption(f"{e['section']} › {e['subsection']}")
+            _render_ref_card(e, "q")
+        return
+    current = None
+    for e in shown:                       # section browse: grouped by sub-section
+        if e["subsection"] != current:
+            current = e["subsection"]
+            st.subheader(current)
+        _render_ref_card(e, "s")
+
+
 def render_drug_of_the_day():
     """Featured 'Drug of the Day' card for the home page, plus an archive of the
     previous days. The pick is a deterministic function of the date, so the
@@ -4547,6 +4691,7 @@ def render_report_form(ctx: Dict[str, Any]):
 
 # ============================== Page sections ==============================
 _MODE_ASK, _MODE_EXPLORE, _MODE_LIBRARY = "💬 Ask", "🔎 Explore", "💊 Drug Library"
+_MODE_REFERENCE = "📘 Reference"
 
 
 def render_sidebar(mode: str) -> Dict[str, Any]:
@@ -8739,7 +8884,8 @@ def streamlit_app():
     st.session_state.setdefault("chat", [])
 
     modes = ([_MODE_ASK] if HAS_CHAT else []) + [_MODE_EXPLORE] + \
-        ([_MODE_LIBRARY] if HAS_DRUG_LIBRARY else [])
+        ([_MODE_LIBRARY] if HAS_DRUG_LIBRARY else []) + \
+        ([_MODE_REFERENCE] if HAS_MAINSTREAM_REF else [])
     st.session_state.setdefault("app_mode", modes[0])
     if st.session_state["app_mode"] not in modes:
         st.session_state["app_mode"] = modes[0]
@@ -8747,6 +8893,9 @@ def streamlit_app():
                     label_visibility="collapsed")
     if mode == _MODE_LIBRARY:
         render_drug_library()
+        return
+    if mode == _MODE_REFERENCE:
+        render_mainstream_reference()
         return
     opts = render_sidebar(mode)
     if mode == _MODE_ASK:
