@@ -5769,7 +5769,29 @@ _CONTRAST_RE = re.compile(r"\brather than\b|\binstead of\b|,\s*however,|\bhoweve
 _TARGET_SUBJECT_RE = re.compile(r"^(?:the )?[\w\-α-ω]+(?: [\w\-α-ω]+)? (?:receptors?|enzymes?|"
                                 r"channels?|transporters?) (?:are|is)\b", re.I)
 _USES_CLAUSE_RE = re.compile(r"\bused (?:in|for) the treatment|\bused to treat\b|"
-                             r"\bindicated (?:for|in)\b|\bsold under the brand", re.I)
+                             r"\bindicated (?:for|in)\b|\bsold under the brand|"
+                             r"\bis used for its\b|\bused in the (?:therapy|management) of\b",
+                             re.I)
+# Sentences that sit in a 'Pharmacology' / 'Mechanism' section but answer a
+# different question — how it's metabolised, its formulation or stereochemistry,
+# PubChem's ChEBI role boilerplate — kept out of 'how does it work' entirely.
+_MECH_OFFTOPIC_RE = re.compile(
+    r"\bha(?:s|ve) (?:a )?roles? as\b|\bxenobiotic\b|\benvironmental contaminant\b|"
+    r"\bundergoes? (?:\w+ ){0,3}metabolism\b|\bis (?:extensively |mainly |largely )?"
+    r"metaboli[sz]ed\b|\bmetaboli[sz]ed (?:by|in|via|to)\b|\bglucuronid\w*|\bhalf-?life\b|"
+    r"\bexcreted\b|\bbioavailab\w*|\bpatch(?:es)?\b|\bformulations?\b|\benantiomers?\b|"
+    r"\bracemic\b|\bstereogenic\b|\bchiral\b|\bmirror-image\b|\bultraviolet\b|\bUV (?:light|"
+    r"exposure|radiation)\b|\bmarketed as\b", re.I)
+# Advice or asides that only make sense next to a sentence the reader can't see.
+_ORPHAN_RE = re.compile(r"^given\b|\bsuch (?:a |an )?(?:risk|circumstances?|cases?|patients?|"
+                        r"situations?)\b|\bin such\b|\bit is better to\b|"
+                        r"^this (?:occurred|was|happened)\b", re.I)
+# Study write-ups and dose-specific findings: fine as detail, not as 'effects'.
+_STUDY_DETAIL_RE = re.compile(r"\bstud(?:y|ies)\b|\b\d+(?:\.\d+)?\s*mg\b|^no effect\b", re.I)
+# Consequence sentences that finish the mechanism's story ('This results in
+# decreased prostaglandins that mediate pain…').
+_CONSEQUENCE_RE = re.compile(r"^(?:this|which|these effects?) (?:results? in|leads? to|causes?)\b|"
+                             r"^as a (?:result|consequence)\b", re.I)
 # Statements about the drug combined with another, or animal findings — true,
 # but not the answer to "how does X work".
 _MECH_ASIDE_RE = re.compile(r"\bcombin\w*|\bco-?administ\w*|\btogether with\b|"
@@ -5916,6 +5938,8 @@ def _mech_score(text: str, src: str, names_re, origin: str = "",
         score -= 3
     if _USES_CLAUSE_RE.search(text):
         score -= 2                        # a 'what is it' sentence, not 'how it works'
+    if re.match(r"^\S+(?: \S+)? is (?:mainly |mostly |commonly |widely )?used\b", text, re.I):
+        score -= 3                        # opens with its uses: 'X is used for its … properties by…'
     if re.search(r"\bselective(?:ly)?\b", text, re.I):
         score += 1                        # 'selectively inhibits…' names the main action
     if class_words:
@@ -5967,6 +5991,12 @@ def _outcome_score(text: str, names_re) -> float:
         sc -= 2
     if len(text) > 250:
         sc -= 2
+    if _CONSEQUENCE_RE.search(text):
+        sc += 3                           # finishes the story: '…which mediate pain, fever'
+                                          # (+1 offsets the 'This …' lead-in penalty)
+    if re.match(r"^\S+(?: \S+)? is (?:mainly |mostly |commonly |widely )?used\b", text, re.I) \
+            or _USES_CLAUSE_RE.search(text):
+        sc -= 3                           # a uses sentence, not a result
     return sc
 
 
@@ -5996,6 +6026,8 @@ def _mech_material(ctx):
         text = _tidy(text)
         ws = _content_words(text)
         if len(text) < 20 or dd.is_dup(ws) or dd.is_restatement(ws):
+            continue
+        if origin != "chembl" and (_MECH_OFFTOPIC_RE.search(text) or _ORPHAN_RE.search(text)):
             continue
         dd.accept(ws)
         out.append((text, src, url, origin))
@@ -6032,21 +6064,31 @@ def _ans_mechanism(ctx, name, p):
     if scored and scored[0][0] >= 3:
         summary.append(scored[0][1])
         first = scored[0][1][0]
-        # add a second line when the first doesn't say what it RESULTS in —
-        # and that isn't just the first one reworded
-        if not (_MECH_OUT_RE.search(first) or _EFFECT_RE.search(first)):
+        # add a second line when the first doesn't say what it means for the
+        # BODY (less pain, lower glucose…) — and that isn't the first reworded.
+        # 'Inhibits COX → fewer prostaglandins' needs '→ less pain and fever'.
+        if not _EFFECT_RE.search(first):
             fw = _content_words(first)
             outs = sorted(((_outcome_score(m[0], names_re), m) for _sc, m in scored[1:]
-                           if len(fw & _content_words(m[0])) < 0.5 * max(1, len(_content_words(m[0])))),
+                           if _EFFECT_RE.search(m[0]) and not _ORPHAN_RE.search(m[0])
+                           and len(fw & _content_words(m[0])) < 0.5 * max(1, len(_content_words(m[0])))),
                           key=lambda x: -x[0])
-            if outs and outs[0][0] >= 5:
+            if outs and outs[0][0] >= 4:
                 summary.append(outs[0][1])
+    # the user's own study notes, when the drug is in their reference
+    mine = []
+    if HAS_MAINSTREAM_REF:
+        ref = mref.find_entry(name, ctx.get("compound_name") or "",
+                              (ctx.get("drug_hit") or {}).get("name", ""))
+        if ref:
+            mine = [(ref["mechanism"], "Your reference", "")]
     if rel:
         blocks += _answer_box(rel, label=f"About “{_focus_label(p)}”")
-        blocks += _pts(_dedup_against([(t, s, u) for t, s, u, _o in summary],
-                                      [t for t, _, _ in rel]), title="How it works", cap=2)
+        blocks += _pts(mine + _dedup_against([(t, s, u) for t, s, u, _o in summary],
+                                             [t for t, _, _ in rel]), title="How it works", cap=3)
     else:
-        blocks += _answer_box([(t, s, u) for t, s, u, _o in summary], label="In short")
+        blocks += _answer_box(mine + [(t, s, u) for t, s, u, _o in summary],
+                              label="Mechanism of action")
     shown = [t for t, _s, _u in rel] + [m[0] for m in summary]
 
     # 2) molecular targets as chips (ChEMBL curated + Guide to Pharmacology)
@@ -6069,6 +6111,11 @@ def _ans_mechanism(ctx, name, p):
             continue
         if _RESEARCH_RE.search(t) or _STRONG_DETAIL_RE.search(t) or _MECH_ASIDE_RE.search(t):
             continue                      # animal / lab / combination findings → detail
+        if not (names_re and names_re.search(t) or _DRUG_ANAPHOR_RE.match(t)
+                or _MECH_ACT_RE.search(t) or _MECH_OUT_RE.search(t)):
+            continue                      # not about this drug's action at all
+        if _USES_CLAUSE_RE.search(t) or _STUDY_DETAIL_RE.search(t):
+            continue                      # what it's for / trial detail → not an effect
         sc = 2 + (2 if o == "label_pd" else 0) + (1 if names_re and names_re.search(t) else 0) \
             - (1 if len(t) > 300 else 0) - (2 if _NEGATION_RE.search(t) else 0) \
             - (1 if _LEADIN_RE.match(t) else 0)
@@ -6079,11 +6126,17 @@ def _ans_mechanism(ctx, name, p):
 
     # 4) everything else, collapsed (lab/animal findings and list lead-ins
     # last); hedges as a footnote rather than a headline
-    detail = [(t, s, u) for t, s, u, _o in usable if t not in shown]
+    # ChEMBL one-liners are already the Targets chips
+    detail = [(t, s, u) for t, s, u, o in usable if t not in shown and o != "chembl"]
     detail.sort(key=lambda it: bool(_RESEARCH_RE.search(it[0]) or _MECH_ASIDE_RE.search(it[0])
                                     or _STRONG_DETAIL_RE.search(it[0])
                                     or it[0].rstrip().endswith(":")))
     blocks += _pts(detail, cap=0, more="More on the mechanism")
+    # a footnote only when a source says THIS drug's mechanism is uncertain —
+    # not any hedge (a cohort study's 'risk is unclear')
+    hedges = [h for h in hedges if len(h[0]) < 220
+              and re.search(r"\bmechanism|\bmode of action\b|\bhow it works\b", h[0], re.I)
+              and (names_re and names_re.search(h[0]) or _DRUG_ANAPHOR_RE.match(h[0]))]
     if hedges:
         note = _tidy(hedges[0][0])
         blocks.append(_b("caption", v=f"Note — {_md_safe(note)} ({hedges[0][1]})"))
