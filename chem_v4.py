@@ -3596,8 +3596,8 @@ def render_mainstream_reference():
         sec_pick = st.selectbox("Section", sec_names, key="ref_section")
     with c2:
         query = st.text_input("Search the reference", key="ref_search",
-                              placeholder="e.g. serotonin syndrome, CYP2D6, "
-                                          "beta-blocker, gout…")
+                              placeholder="Any word, any column — e.g. phlegm, "
+                                          "serotonin syndrome, CYP2D6, gout…")
     c3, c4 = st.columns([3, 1])
     with c3:
         tags = st.pills("On list", list(mref.TAG_LABELS), selection_mode="multi",
@@ -3606,7 +3606,8 @@ def render_mainstream_reference():
         view = st.radio("View", ["Cards", "Table"], key="ref_view", horizontal=True)
 
     rows = all_rows
-    if sec_pick != _REF_ALL:
+    # A search always covers every section — the Section box is for browsing.
+    if sec_pick != _REF_ALL and not query.strip():
         no = int(sec_pick.split(".", 1)[0])
         rows = [e for e in rows if e["section_no"] == no]
     if tags:
@@ -3615,12 +3616,20 @@ def render_mainstream_reference():
         rows = [e for e in rows if e["tag"] in want]
     if query.strip():
         rows = mref.search(query, rows)
+        notes = []
+        for t in mref.expand_query(query):
+            if t["corrected_from"]:
+                notes.append(f"*{t['corrected_from']}* → **{t['term']}**")
+            if len(t["alts"]) > 1:
+                notes.append(f"**{t['term']}** also matches " +
+                             ", ".join(t["alts"][1:]))
+        st.caption("Searching all sections." + (" " + " · ".join(notes) if notes else ""))
     elif sec_pick == _REF_ALL:
         st.info("Pick a section, or search to look across the whole reference.")
         return
 
     if not rows:
-        st.info("Nothing matched — try fewer words or another section.")
+        st.info("Nothing matched — try fewer or different words.")
         return
     shown = rows[:_REF_RESULT_CAP] if query.strip() else rows
     more = f" (showing first {len(shown)})" if len(shown) < len(rows) else ""

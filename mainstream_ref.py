@@ -7,6 +7,7 @@ class, mechanism, uses, cautions, id. Some rows group several drugs that share
 a mechanism ("Enalapril / perindopril / captopril"); `drug_links()` splits
 those so each name can open its own Explore page.
 """
+import difflib
 import json
 import re
 from functools import lru_cache
@@ -86,20 +87,161 @@ def drug_links(entry: dict) -> list:
     return out
 
 
+# Everyday words → the clinical vocabulary the reference is written in. Hand
+# curated (no AI); each key also matches itself. Spelling variants (ae/oe) are
+# handled by _norm, so only list genuinely different words here.
+SYNONYMS = {
+    # not bare "mucus" — it also hits "cervical mucus" under contraceptives
+    "phlegm": ["sputum", "expectorant", "mucolytic", "productive cough"],
+    "mucus": ["sputum", "mucolytic", "expectorant"],
+    "chesty": ["productive cough", "sputum", "expectorant"],
+    "snot": ["rhinitis", "nasal", "decongestant"],
+    "runny": ["rhinitis", "nasal"],
+    "stuffy": ["nasal congestion", "decongestant"],
+    "blocked": ["congestion", "decongestant", "obstruction"],
+    "heartburn": ["reflux", "gord", "dyspepsia", "acid suppression"],
+    "indigestion": ["dyspepsia", "reflux"],
+    "ulcer": ["ulceration", "peptic"],
+    "painkiller": ["analgesic", "analgesia"],
+    "pain": ["analgesic", "analgesia"],
+    "fever": ["antipyretic", "pyrexia"],
+    "temperature": ["fever", "antipyretic"],
+    "itch": ["pruritus", "itching"],
+    "itchy": ["pruritus", "itching"],
+    "rash": ["eruption", "urticaria", "skin reaction", "dermatitis"],
+    "hives": ["urticaria"],
+    "allergy": ["allergic", "antihistamine", "anaphylaxis", "hay fever"],
+    "sleep": ["insomnia", "hypnotic", "sedation", "drowsiness"],
+    "sleepy": ["drowsiness", "sedation"],
+    "drowsy": ["drowsiness", "sedation"],
+    "anxiety": ["anxiolytic", "panic"],
+    "depression": ["antidepressant", "depressive"],
+    "constipation": ["laxative", "constipating"],
+    "sick": ["nausea", "vomiting", "antiemetic"],
+    "vomiting": ["antiemetic", "emesis", "nausea"],
+    "nausea": ["antiemetic", "vomiting"],
+    "bp": ["blood pressure", "hypertension"],
+    "blood thinner": ["anticoagulant", "antiplatelet"],
+    "thinner": ["anticoagulant", "antiplatelet"],
+    "clot": ["thrombosis", "thrombotic", "anticoagulant", "embolism", "vte"],
+    "bleeding": ["haemorrhage", "bleed"],
+    "heart attack": ["myocardial infarction", "mi", "acs"],
+    "fits": ["seizure", "epilepsy", "convulsion"],
+    "seizure": ["epilepsy", "antiepileptic", "convulsion", "seizure threshold"],
+    "sugar": ["glucose", "glycaemic", "hypoglycaemia", "diabetes"],
+    "cholesterol": ["lipid", "ldl", "statin"],
+    "kidney": ["renal", "nephrotoxic", "nephrotoxicity"],
+    "liver": ["hepatic", "hepatotoxicity", "hepatitis"],
+    "weight": ["obesity", "weight gain", "weight loss", "appetite"],
+    "hair loss": ["alopecia"],
+    "acne": ["acne vulgaris", "retinoid"],
+    "eczema": ["dermatitis", "atopic"],
+    "asthma": ["bronchospasm", "bronchodilator"],
+    "wheeze": ["bronchospasm", "asthma", "bronchodilator"],
+    "breathless": ["dyspnoea", "breathlessness"],
+    "pregnant": ["pregnancy", "teratogenic", "teratogen"],
+    "pregnancy": ["teratogenic", "teratogen"],
+    "baby": ["neonatal", "neonates", "infant", "foetal"],
+    "children": ["paediatric", "child"],
+    "elderly": ["older", "falls"],
+    "infection": ["antibacterial", "antibiotic", "sepsis"],
+    "antibiotic": ["antibacterial"],
+    "water tablet": ["diuretic"],
+    "erection": ["erectile"],
+    "period": ["menstrual", "dysmenorrhoea", "menorrhagia"],
+    "migraine": ["triptan", "headache"],
+    "dizzy": ["dizziness", "vertigo", "postural hypotension"],
+}
+# haem/hem, oesophagus/esophagus, oedema/edema, diarrhoea/diarrhea
+_SPELL_RE = [(re.compile(r"ae"), "e"), (re.compile(r"oe"), "e")]
+
+
+def _norm(text: str) -> str:
+    """Case-fold and fold British/US spelling (haemorrhage = hemorrhage,
+    oedema = edema, diarrhoea = diarrhea) so either spelling matches."""
+    text = text.casefold()
+    for rx, rep in _SPELL_RE:
+        text = rx.sub(rep, text)
+    return text
+
+
+def _hay(e: dict) -> str:
+    return _norm(" ".join((e["drug"], e["class"], e["mechanism"], e["uses"],
+                           e["cautions"], e["subsection"] or "")))
+
+
+@lru_cache(maxsize=1)
+def _vocab() -> tuple:
+    words = set()
+    for e in entries():
+        words.update(w for w in re.findall(r"[a-z][a-z0-9-]{3,}", _hay(e)))
+    words.update(_norm(k) for k in SYNONYMS if " " not in k)
+    return tuple(sorted(words))
+
+
+def _has(hay: str, term: str) -> bool:
+    """`term` at the start of a word in `hay` ("cough" matches "coughing",
+    "mi" doesn't match "vomiting"); terms of ≤3 letters must be the whole word
+    ("mi" doesn't match "midodrine")."""
+    tail = r"(?![a-z0-9])" if len(term) <= 3 else ""
+    return re.search(r"(?<![a-z0-9])" + re.escape(term) + tail, hay) is not None
+
+
+def expand_query(query: str) -> list:
+    """Split `query` into terms, each with the alternatives it may match:
+    [{"term", "alts", "corrected_from"}]. Two-word synonym keys ("blood
+    thinner") are kept together; an unknown word is typo-corrected against the
+    reference's own vocabulary ("ohlegm" → "phlegm")."""
+    q = " ".join(_norm(query).split())
+    terms = []
+    for key in sorted((k for k in SYNONYMS if " " in k), key=len, reverse=True):
+        if _norm(key) in q:
+            terms.append(_norm(key))
+            q = q.replace(_norm(key), " ")
+    terms += q.split()
+    hays = [_hay(e) for e in entries()]
+    out = []
+    for t in terms:
+        corrected = None
+        known = t in {_norm(k) for k in SYNONYMS} or any(_has(h, t) for h in hays)
+        if not known and len(t) >= 4:
+            close = difflib.get_close_matches(t, _vocab(), n=1, cutoff=0.75)
+            if close:
+                corrected, t = t, close[0]
+        syn = next((v for k, v in SYNONYMS.items() if _norm(k) == t), [])
+        out.append({"term": t, "alts": [t] + [_norm(s) for s in syn],
+                    "corrected_from": corrected})
+    return out
+
+
 def search(query: str, rows=None) -> list:
-    """Entries whose text contains every word of `query` (case-insensitive),
-    drug-name matches first."""
-    words = query.casefold().split()
-    if not words:
+    """Entries matching every term of `query` (or one of its synonyms /
+    spelling variants) anywhere in the row — name, class, mechanism, uses,
+    cautions. Ranked: drug-name matches, then rows where it's what the drug
+    is FOR (uses / mechanism / class), then cautions-only mentions; within
+    each, literal-word matches before synonym-only ones."""
+    terms = expand_query(query)
+    if not terms:
         return list(rows if rows is not None else entries())
+
+    def all_in(text):
+        return all(any(_has(text, a) for a in t["alts"]) for t in terms)
+
     hits = []
     for e in rows if rows is not None else entries():
-        hay = " ".join((e["drug"], e["class"], e["mechanism"], e["uses"],
-                        e["cautions"], e["subsection"] or "")).casefold()
-        if all(w in hay for w in words):
-            in_name = all(w in e["drug"].casefold() for w in words)
-            hits.append((0 if in_name else 1, e["id"], e))
-    return [e for _, _, e in sorted(hits, key=lambda h: h[:2])]
+        hay = _hay(e)
+        if not all_in(hay):
+            continue
+        if all_in(_norm(e["drug"])):
+            where = 0
+        elif all_in(_norm(" ".join((e["uses"], e["mechanism"], e["class"],
+                                    e["subsection"] or "")))):
+            where = 1
+        else:
+            where = 2
+        literal = all(_has(hay, t["term"]) for t in terms)
+        hits.append((where, 0 if literal else 1, e["id"], e))
+    return [h[-1] for h in sorted(hits, key=lambda h: h[:3])]
 
 
 def find_entries(*names: str) -> list:

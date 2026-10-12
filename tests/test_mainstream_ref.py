@@ -85,6 +85,34 @@ def test_search_ranks_name_matches_first():
     assert len(hits) > 1          # also mentioned in other rows' cautions
 
 
+@pytest.mark.parametrize("query", ["phlegm", "ohlegm", "productive cough", "Phlegm"])
+def test_lay_words_and_typos_find_the_cough_drugs(query):
+    names = [e["drug"] for e in mref.search(query)]
+    assert "Guaifenesin" in names
+    assert not any("contraceptive" in n.lower() for n in names)   # "cervical mucus"
+
+
+def test_typo_is_reported_as_corrected():
+    t = mref.expand_query("ohlegm")[0]
+    assert (t["corrected_from"], t["term"]) == ("ohlegm", "phlegm")
+
+
+@pytest.mark.parametrize("us, uk_drug", [
+    ("diarrhea", "Loperamide"), ("edema", "Furosemide (frusemide)"),
+    ("hyperkalemia", "Spironolactone")])
+def test_us_spelling_matches_british_text(us, uk_drug):
+    assert uk_drug in [e["drug"] for e in mref.search(us)]
+
+
+def test_drugs_used_for_it_rank_above_side_effect_mentions():
+    names = [e["drug"] for e in mref.search("heartburn")]
+    assert names.index("Omeprazole") < names.index("Dabigatran")
+
+
+def test_short_terms_match_whole_words_only():
+    assert not any(e["drug"].startswith("Mi") for e in mref.search("mi"))
+
+
 def _reference_page():
     at = AppTest.from_file(APP, default_timeout=120)
     at.run()
@@ -99,6 +127,16 @@ def test_every_section_renders():
         at.selectbox(key="ref_section").set_value(opt)
         at.run()
         assert not at.exception, (opt, at.exception[0].value)
+
+
+def test_search_ignores_the_selected_section():
+    at = _reference_page()
+    at.selectbox(key="ref_section").set_value("4. Cardiovascular Drugs")
+    at.text_input(key="ref_search").set_value("phlegm")
+    at.run()
+    assert not at.exception
+    assert any(m.value.startswith("**3** entries") for m in at.markdown)
+    assert any("Searching all sections" in c.value for c in at.caption)
 
 
 @pytest.mark.network
