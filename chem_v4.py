@@ -3524,13 +3524,26 @@ def _render_ref_card(e: Dict, key_prefix: str):
         c3.markdown(f"**Key cautions & signature effects**  \n{e['cautions']}")
 
 
-def _ref_table_select(rows: List[Dict], key: str):
-    """Table-view row click: a row naming one drug opens it straight away;
-    a grouped row is left selected so the picker below can offer each drug."""
+def _ref_picked_row(key: str) -> Optional[int]:
+    """Row the user picked in the table: ticked its checkbox, or clicked its
+    Drug cell. Clicks on other cells (to read a long mechanism) don't count."""
     sel = st.session_state.get(key)
-    picked = sel.selection.rows if sel is not None else []
-    if picked:
-        links = [q for _, q in mref.drug_links(rows[picked[0]]) if q]
+    if sel is None:
+        return None
+    if sel.selection.get("rows"):
+        return sel.selection["rows"][0]
+    for row, col in sel.selection.get("cells") or []:
+        if col == "Drug":
+            return row
+    return None
+
+
+def _ref_table_select(rows: List[Dict], key: str):
+    """Table-view pick: a row naming one drug opens it straight away; a grouped
+    row stays selected so the picker below can offer each drug."""
+    picked = _ref_picked_row(key)
+    if picked is not None:
+        links = [q for _, q in mref.drug_links(rows[picked]) if q]
         if len(links) == 1:
             _open_drug(links[0])
 
@@ -3545,17 +3558,20 @@ def _render_ref_table(rows: List[Dict], key: str):
         "Key cautions": e["cautions"],
         "Sub-section": e["subsection"],
     } for e in rows])
+    # Picker for a grouped row sits ABOVE the table (a tall table hides it below);
+    # the selection is already in session state from the click that reran us.
+    picked = _ref_picked_row(key)
+    if picked is not None:
+        st.caption("Open which drug from this row?")
+        _ref_drug_buttons(rows[picked], "tblpick")
+    else:
+        st.caption("Click a drug's name (or tick its row) to open it.")
     st.dataframe(
         df, key=key, hide_index=True, on_select=lambda: _ref_table_select(rows, key),
-        selection_mode="single-row", width="stretch", height=min(700, 38 + 35 * len(df)),
+        selection_mode=["single-row", "single-cell"], width="stretch",
+        height=min(700, 38 + 35 * len(df)),
         column_config={c: st.column_config.TextColumn(c, width="large")
                        for c in ("Mechanism", "Main uses", "Key cautions")})
-    sel = st.session_state.get(key)
-    picked = sel.selection.rows if sel is not None else []
-    if picked:
-        e = rows[picked[0]]
-        st.caption("Open which drug from this row?")
-        _ref_drug_buttons(e, "tblpick")
 
 
 def render_mainstream_reference():
