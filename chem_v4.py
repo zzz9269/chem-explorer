@@ -951,10 +951,20 @@ def _entry_rank(text: str) -> int:
     2 = boilerplate / external-resource descriptions / 'see more' pointers.
     Ties keep PubChem's original order (stable sort)."""
     t = (text or "").strip()
-    for rx in _LOWVALUE_ENTRY_RES:
-        if rx.search(t):
+    if any(rx.search(t) for rx in _LOWVALUE_ENTRY_RES):
+        # a long monograph block that merely ENDS with 'please visit …' is
+        # still substantive — judge it on what's left without the pointer
+        t = _strip_pointer_sentences(t)
+        if len(re.findall(r"[A-Za-z]{3,}", t)) < 20:
             return 2
     return 0 if len(re.findall(r"[A-Za-z]{3,}", t)) >= 20 else 1
+
+
+def _strip_pointer_sentences(text: str) -> str:
+    """Drop just the boilerplate / 'please visit …' sentences from an entry."""
+    sents = re.split(r"(?<=[a-z0-9)\]][.!?])\s+(?=[A-Z0-9/])", (text or "").strip())
+    return " ".join(s for s in sents
+                    if not any(rx.search(s) for rx in _LOWVALUE_ENTRY_RES)).strip()
 
 
 def _heading_priority(heading: str, val: Any) -> float:
@@ -1745,7 +1755,7 @@ def _combined_items(heading: str, val: Dict[str, Any]) -> List[Tuple[str, str]]:
     for e in entries:
         if _entry_rank(e) == 2:                      # boilerplate / pointers
             continue
-        for s in _split_sentences(e):
+        for s in _split_sentences(_strip_pointer_sentences(e)):
             raw.append((s, "PubChem"))
     # Wikipedia's plain-language sentences first so, within a tier, they lead
     # (PubChem's tend to be denser label/monograph prose).
@@ -1780,6 +1790,20 @@ def _combined_items(heading: str, val: Dict[str, Any]) -> List[Tuple[str, str]]:
         tiers[tier].append((s, src))
         prev_src, prev_tier = src, tier
     return tiers[0] + tiers[1] + tiers[2]
+
+
+def _record_lead_sentence(val: Dict[str, Any]) -> str:
+    """First sentence of the most substantive PubChem entry, as it appears in
+    _combined_items (same splitting/cleaning), or '' when there is none."""
+    entries = [p.strip() for p in str(val.get("pubchem") or "").split(" | ") if p.strip()]
+    entries = [e for e in sorted(entries, key=_entry_rank) if _entry_rank(e) == 0]
+    if not entries:
+        return ""
+    sents = _split_sentences(_strip_pointer_sentences(entries[0]))
+    s = sents[0] if sents else ""
+    if not s or _HEDGE_RE.search(s) or _STRONG_DETAIL_RE.search(s):
+        return ""
+    return s
 
 
 _CONTINUATION_RE = re.compile(
@@ -2005,6 +2029,14 @@ def _render_combined(heading: str, val: Dict[str, Any], key: str = ""):
         # Summary-first: a few key points always visible, ALL detail behind
         # one toggle (a well-studied drug has dozens of on-topic sentences).
         kp = [(t, s, u) for t, s, u in val.get("key_points") or []]
+        if len(kp) < 2:
+            # the record's opening sentence is its curated summary (and is the
+            # line previewed in the collapsed group label) — lead with it
+            lead = _record_lead_sentence(val)
+            hit = next((it for it in items if it == (lead, "PubChem")), None)
+            if hit:
+                kp.append((lead, "PubChem", ""))
+                items = [it for it in items if it is not hit]
         if len(kp) < 2:
             # thin curated summary (no label MoA section, or ChEMBL only):
             # top up with the clearest on-topic sentences, to 3 in all
@@ -2814,7 +2846,8 @@ def record_indication_sentence(grouped: Dict[str, Dict[str, Any]]) -> str:
         if not re.search(r"indication|therapeutic use|uses", heading, re.I):
             continue
         pub, bullets, _ = _split_value_parts(val)
-        texts = [p for p in pub.split(" | ") if p.strip() and _entry_rank(p) < 2] + bullets
+        texts = [_strip_pointer_sentences(p) for p in pub.split(" | ")
+                 if p.strip() and _entry_rank(p) < 2] + bullets
         for t in texts:
             for s in _SENT_SPLIT_RE.split(re.sub(r"\s+", " ", t)):
                 s = _clean_record_sentence(s)
