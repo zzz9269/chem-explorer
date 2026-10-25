@@ -26,7 +26,9 @@ What it recognises
 from __future__ import annotations
 
 import difflib
+import json
 import math
+import os
 import re
 from functools import lru_cache
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -89,7 +91,7 @@ mean means happen happens happening safe make makes made good bad best better
 long short time times lot lots pretty quite person people someone patient
 patients doctor pharmacist drugx compound chemical substance molecule
 difference differences between compare versus list some examples example name
-names number numbers anything everything
+names number numbers anything everything making having getting giving
 """.split())
 
 # Common English (and health-chat) words: never treated as a drug/brand name or
@@ -306,6 +308,9 @@ LAY_SYNONYMS: Dict[str, Tuple[str, ...]] = {
     "sneeze": ("histamine", "rhinitis"), "sneezing": ("histamine", "rhinitis"),
     "inflammation": ("anti-inflammatory", "prostaglandin", "cyclooxygenase", "cox"),
     "swelling": ("edema", "oedema", "inflammation"),
+    "swell": ("edema", "oedema", "swelling"), "swollen": ("edema", "oedema", "swelling"),
+    "ankle": ("peripheral edema", "peripheral oedema", "pedal edema", "edema"),
+    "ankles": ("peripheral edema", "peripheral oedema", "pedal edema", "edema"),
     "infection": ("antibacterial", "bacterial", "bactericidal", "antimicrobial"),
     "bacteria": ("antibacterial", "bacterial", "cell wall", "bactericidal"),
     "germs": ("antibacterial", "antimicrobial"),
@@ -677,7 +682,7 @@ INTENT_TITLES = {
     "structure": "Structure", "properties": "Properties", "spectra": "Spectra",
     "history": "History", "synthesis": "How it's made", "legal": "Abuse & legal status",
     "storage": "Storage", "cost": "Cost", "ingredients": "Ingredients",
-    "search": "From the record",
+    "concept": "Concept", "search": "From the record",
 }
 
 # Which ADME fact a pharmacokinetics question is about.
@@ -700,6 +705,61 @@ _PK_FACT_RES = [
 _COMPARE_RE = re.compile(r"\b(?:vs\.?|versus|compare\w*|comparison|differen\w*|differ|"
                          r"better|worse|stronger|weaker|which (?:is|one)|or)\b")
 _CONNECT_RE = re.compile(r"\b(?:with|and|plus|together|while (?:on|taking)|after)\b|[+&]")
+# Two medicines used at the same time — 'can I take ibuprofen for my headache
+# if I'm ON WARFARIN' is an interaction question whatever else it mentions
+# (answering each drug's uses said 'Yes' to a risky combination).
+_COUSE_RE = re.compile(
+    r"\b(?:i'?m|i am|im|i'?ve been|already|currently|still|been)\s+(?:\w+\s+){0,2}?"
+    r"(?:on|taking|using)\s+(?:\w+\s+){0,2}?drugx\b|"
+    r"\b(?:if|while|whilst|when|since|as)\s+(?:i'?m\s+|i am\s+|im\s+|you'?re\s+|someone is\s+)?"
+    r"(?:\w+\s+){0,2}?(?:on|taking|using)\s+(?:\w+\s+){0,2}?drugx\b|"
+    r"\btake (?:both )?drugx (?:and|with|plus|\+|&) drugx\b|"
+    r"\bwith (?:my |the |some |a |an |his |her )?drugx\b|"
+    r"\b(?:together|at the same time|same time|combin\w*|mix\w*|alongside)\b")
+# A why-question about one drug and one topic ('why does warfarin have so many
+# interactions') is answered by the explanation ranker; these words widen the
+# topic so sentences that explain it (CYP2C9, protein binding…) count.
+_WHY_TOPIC_TERMS: Dict[str, Tuple[str, ...]] = {
+    "interactions": ("interact", "CYP", "cytochrome", "metaboli", "protein-bound", "protein binding",
+                     "narrow therapeutic", "vitamin K", "inhibitor", "inducer", "P-glycoprotein"),
+    "pk": ("half-life", "metaboli", "excret", "clearance", "absorb", "bioavailab", "protein-bound",
+           "distribut", "eliminat"),
+    "dosing": ("food", "meal", "absorb", "empty stomach", "bedtime", "morning", "evening", "night"),
+    "warnings": ("contraindicat", "risk", "caution", "avoid"),
+    "pregnancy": ("pregnan", "fetal", "fetus", "teratogen", "birth defect", "placenta"),
+    "overdose": ("overdose", "toxicity", "poisoning"),
+    "side_effects": (),
+}
+_WHY_TOPIC_PHRASE = {"interactions": "interactions", "pk": "how the body handles it",
+                     "dosing": "how it's taken", "warnings": "warnings", "pregnancy": "pregnancy",
+                     "overdose": "overdose"}
+# Words that name a condition or a mechanism, not a chemical: leftover words
+# like these make a concept question ('what is Hashimoto's thyroiditis').
+_CONCEPT_WORD_RE = re.compile(
+    r"\b(?:\w+itis|\w+osis|\w+[ae]emia|\w+pathy|\w+algia|syndrome|disease|disorder|deficiency|"
+    r"infection|cancer|carcinoma|tumou?r|kinetics|reaction|failure|insufficiency|resistance|"
+    r"toxicity|poisoning|allergy|intolerance|receptors?|enzymes?|pathway|hormones?|"
+    r"neurotransmitters?|transporters?|metabolism|cycle)\b")
+# A question with no medicine in it is looked up as a concept only when it
+# sounds medical — 'what's the weather like today' stays out of scope.
+_MEDICAL_HINT_RE = re.compile(
+    r"(?:itis|osis|[ae]emia|pathy|algia|ectomy|plasia|trophy|pn(?:o)?ea|uria|lysis|genesis|cardi|"
+    r"hepat|nephr|renal|neur|derm|gastr|pulmon|vascul|thromb|ha?em|immun|endocrin|hormon|insulin|"
+    r"glyc|lipid|cholesterol|tension|infect|bacteri|viral|virus|fung|cancer|tumou?r|syndrome|"
+    r"disease|disorder|deficien|receptor|enzyme|kinase|channel|transporter|metabol|kinetic|"
+    r"pharmac|toxic|dose|drug|medic|therap|symptom|pain|ache|fever|cough|allerg|asthma|diabet|"
+    r"depress|anxi|insomnia|migraine|epilep|seizure|stroke|arrhythm|fibrillation|angina|ulcer|"
+    r"reflux|nausea|vomit|diarrh|constipat|acne|eczema|psoria|arthritis|gout|osteopor|thyroid|"
+    r"obes|addict|withdraw|pregnan|fertil|contracept|vaccin|antibod|antigen|blood|heart|liver|"
+    r"kidney|lung|brain|nerve|muscle|bone|skin|stomach|bowel|bladder|prostate|protein|gene\b|"
+    r"\bdna\b|\brna\b|acid|amine|peptide|steroid|glucose|potassium|sodium|calcium|molecul|"
+    r"compound|chemical|hypo|hyper|anti|cyto|patho|physio|psych|biochem|cholin|adren|dopamin|"
+    r"serotonin|gaba|histamin)", re.I)
+# Asking for the members of a class ('list some statins', 'the strongest painkiller').
+_MEMBERS_RE = re.compile(r"\b(?:what are|list|examples?|which (?:drugs|medicines|medications|ones)|"
+                         r"types? of|name (?:some|a few|all)|kinds? of|drugs? (?:in|that are)|members?|"
+                         r"strongest|weakest|best|safest|most (?:effective|potent|common|popular)|"
+                         r"commonly used|common)\b")
 _PRONOUN_RE = re.compile(r"\b(?:it|its|it's|this|that|they|them|their|the drug|the medicine|"
                          r"the medication|this drug|this medicine|same)\b")
 _FOLLOW_ON_RE = re.compile(r"^(?:and|what about|how about|same (?:for|with)|and for|"
@@ -912,72 +972,91 @@ def _brand_entity(entry: Dict) -> Optional[Dict]:
 # ---------------------------------------------------------------------------
 # Drug classes & conditions (Drug Library / WHO ATC)
 # ---------------------------------------------------------------------------
-# User wording → substrings of class names in the library.
-CLASS_ALIASES: List[Tuple[str, Tuple[str, ...]]] = [
-    (r"statins?", ("hmg coa reductase inhibitor",)),
-    (r"ssris?|selective serotonin reuptake inhibitors?", ("selective serotonin reuptake inhibitor",)),
+# User wording → substrings of class names in the library, and the class's own
+# Wikipedia article (titles checked to exist) — what 'how do statins work' /
+# 'why do ACE inhibitors cause a cough' are answered from.
+CLASS_ALIASES: List[Tuple[str, Tuple[str, ...], str]] = [
+    (r"statins?", ("hmg coa reductase inhibitor",), "Statin"),
+    (r"ssris?|selective serotonin reuptake inhibitors?", ("selective serotonin reuptake inhibitor",),
+     "Selective serotonin reuptake inhibitor"),
     (r"snris?|serotonin(?: and)? norepinephrine reuptake inhibitors?",
-     ("serotonin and norepinephrine reuptake inhibitor",)),
+     ("serotonin and norepinephrine reuptake inhibitor",), "Serotonin–norepinephrine reuptake inhibitor"),
     (r"nsaids?|non ?steroidal anti ?inflammator(?:y|ies)(?: drugs?)?",
-     ("nonsteroidal anti inflammatory drug",)),
-    (r"benzos?|benzodiazepines?", ("benzodiazepine",)),
-    (r"opioids?|opiates?|narcotics?", ("opioid agonist", "natural opium alkaloids")),
-    (r"antibiotics?|antibacterials?", ("antibacterials for systemic use",)),
-    (r"antihistamines?", ("antihistamines for systemic use", "histamine 1 receptor antagonist")),
-    (r"beta ?blockers?|beta blocking agents?", ("beta blocking agents", "beta adrenergic blocker")),
-    (r"ace inhibitors?", ("ace inhibitors", "angiotensin converting enzyme inhibitor")),
+     ("nonsteroidal anti inflammatory drug",), "Nonsteroidal anti-inflammatory drug"),
+    (r"benzos?|benzodiazepines?", ("benzodiazepine",), "Benzodiazepine"),
+    (r"opioids?|opiates?|narcotics?", ("opioid agonist", "natural opium alkaloids"), "Opioid"),
+    (r"antibiotics?|antibacterials?", ("antibacterials for systemic use",), "Antibiotic"),
+    (r"antihistamines?", ("antihistamines for systemic use", "histamine 1 receptor antagonist"),
+     "Antihistamine"),
+    (r"beta ?blockers?|beta blocking agents?", ("beta blocking agents", "beta adrenergic blocker"),
+     "Beta blocker"),
+    (r"ace inhibitors?", ("ace inhibitors", "angiotensin converting enzyme inhibitor"), "ACE inhibitor"),
     (r"arbs?|angiotensin(?: ii| 2)? receptor blockers?",
-     ("angiotensin ii receptor blockers", "angiotensin 2 receptor blocker")),
-    (r"ppis?|proton pump inhibitors?", ("proton pump inhibitor",)),
+     ("angiotensin ii receptor blockers", "angiotensin 2 receptor blocker"),
+     "Angiotensin II receptor blocker"),
+    (r"ppis?|proton pump inhibitors?", ("proton pump inhibitor",), "Proton-pump inhibitor"),
     (r"h2 (?:blockers?|antagonists?|receptor antagonists?)", ("h2 receptor antagonist",
-                                                              "histamine 2 receptor antagonist")),
-    (r"calcium channel blockers?|ccbs?", ("calcium channel blocker",)),
-    (r"diuretics?|water pills?", ("diuretic",)),
-    (r"anticoagulants?|blood thinners?", ("anticoagulant",)),
-    (r"antiplatelets?|antiplatelet (?:drugs|agents)", ("platelet aggregation inhibitor",)),
-    (r"antidepressants?", ("antidepressants",)),
-    (r"antipsychotics?|neuroleptics?", ("antipsychotics", "atypical antipsychotic")),
+                                                              "histamine 2 receptor antagonist"),
+     "H2 receptor antagonist"),
+    (r"calcium channel blockers?|ccbs?", ("calcium channel blocker",), "Calcium channel blocker"),
+    (r"diuretics?|water pills?", ("diuretic",), "Diuretic"),
+    (r"anticoagulants?|blood thinners?", ("anticoagulant",), "Anticoagulant"),
+    (r"antiplatelets?|antiplatelet (?:drugs|agents)", ("platelet aggregation inhibitor",),
+     "Antiplatelet drug"),
+    (r"antidepressants?", ("antidepressants",), "Antidepressant"),
+    (r"antipsychotics?|neuroleptics?", ("antipsychotics", "atypical antipsychotic"), "Antipsychotic"),
     (r"anticonvulsants?|antiepileptics?|anti[- ]?seizure (?:drugs|medications|meds)",
-     ("antiepileptics", "anti epileptic agent")),
-    (r"triptans?", ("selective serotonin 5ht1 agonists", "serotonin 1b and 1d receptor agonist")),
-    (r"corticosteroids?|steroids?", ("corticosteroid",)),
-    (r"bisphosphonates?", ("bisphosphonate",)),
-    (r"sulfonylureas?|sulphonylureas?", ("sulfonylurea",)),
+     ("antiepileptics", "anti epileptic agent"), "Anticonvulsant"),
+    (r"triptans?", ("selective serotonin 5ht1 agonists", "serotonin 1b and 1d receptor agonist"),
+     "Triptan"),
+    (r"corticosteroids?|steroids?", ("corticosteroid",), "Corticosteroid"),
+    (r"bisphosphonates?", ("bisphosphonate",), "Bisphosphonate"),
+    (r"sulfonylureas?|sulphonylureas?", ("sulfonylurea",), "Sulfonylurea"),
     (r"dpp ?4 inhibitors?|gliptins?", ("dipeptidyl peptidase 4 inhibitor",
-                                       "dipeptidyl peptidase 4 dpp 4 inhibitors")),
+                                       "dipeptidyl peptidase 4 dpp 4 inhibitors"),
+     "Dipeptidyl peptidase-4 inhibitor"),
     (r"glp ?1(?: receptor)? agonists?|glp ?1s?",
-     ("glucagon like peptide 1 receptor agonist", "glucagon like peptide 1 glp 1 analogues")),
+     ("glucagon like peptide 1 receptor agonist", "glucagon like peptide 1 glp 1 analogues"),
+     "GLP-1 receptor agonist"),
     (r"sglt ?2 inhibitors?|gliflozins?", ("sodium glucose cotransporter 2 inhibitor",
-                                         "sodium glucose co transporter 2 sglt2 inhibitors")),
-    (r"antivirals?", ("antivirals for systemic use",)),
-    (r"antifungals?", ("antimycotics for systemic use", "azole antifungal")),
-    (r"macrolides?", ("macrolides", "macrolide antimicrobial")),
-    (r"cephalosporins?", ("cephalosporin",)),
-    (r"fluoroquinolones?|quinolones?", ("fluoroquinolones", "quinolone antimicrobial")),
-    (r"tetracyclines?", ("tetracyclines", "tetracycline class drug")),
-    (r"penicillins?", ("penicillin class antibacterial", "penicillins")),
-    (r"laxatives?", ("drugs for constipation", "laxative")),
-    (r"antiemetics?|anti[- ]?nausea (?:drugs|medicines|meds)", ("antiemetics and antinauseants",)),
-    (r"decongestants?", ("nasal decongestants", "sympathomimetics")),
-    (r"expectorants?|mucolytics?", ("expectorants", "mucolytics")),
-    (r"cough suppressants?|antitussives?|cough medicines?", ("cough suppressants",)),
-    (r"muscle relaxants?", ("muscle relaxants",)),
-    (r"stimulants?", ("centrally acting sympathomimetics", "central nervous system stimulant")),
-    (r"sedatives?|sleeping pills?|hypnotics?|sleep aids?", ("hypnotics and sedatives",)),
-    (r"local an(?:a)?esthetics?", ("anesthetics local", "local anesthetic")),
-    (r"maois?|mao inhibitors?|monoamine oxidase inhibitors?", ("monoamine oxidase inhibitor",)),
+                                         "sodium glucose co transporter 2 sglt2 inhibitors"),
+     "SGLT2 inhibitor"),
+    (r"antivirals?", ("antivirals for systemic use",), "Antiviral drug"),
+    (r"antifungals?", ("antimycotics for systemic use", "azole antifungal"), "Antifungal"),
+    (r"macrolides?", ("macrolides", "macrolide antimicrobial"), "Macrolide"),
+    (r"cephalosporins?", ("cephalosporin",), "Cephalosporin"),
+    (r"fluoroquinolones?|quinolones?", ("fluoroquinolones", "quinolone antimicrobial"),
+     "Quinolone antibiotic"),
+    (r"tetracyclines?", ("tetracyclines", "tetracycline class drug"), "Tetracycline antibiotics"),
+    (r"penicillins?", ("penicillin class antibacterial", "penicillins"), "Penicillin"),
+    (r"laxatives?", ("drugs for constipation", "laxative"), "Laxative"),
+    (r"antiemetics?|anti[- ]?nausea (?:drugs|medicines|meds)", ("antiemetics and antinauseants",),
+     "Antiemetic"),
+    (r"decongestants?", ("nasal decongestants", "sympathomimetics"), "Decongestant"),
+    (r"expectorants?|mucolytics?", ("expectorants", "mucolytics"), "Mucoactive agent"),
+    (r"cough suppressants?|antitussives?|cough medicines?", ("cough suppressants",), "Cold medicine"),
+    (r"muscle relaxants?", ("muscle relaxants",), "Muscle relaxant"),
+    (r"stimulants?", ("centrally acting sympathomimetics", "central nervous system stimulant"),
+     "Stimulant"),
+    (r"sedatives?|sleeping pills?|hypnotics?|sleep aids?", ("hypnotics and sedatives",), "Sedative"),
+    (r"local an(?:a)?esthetics?", ("anesthetics local", "local anesthetic"), "Local anesthetic"),
+    (r"maois?|mao inhibitors?|monoamine oxidase inhibitors?", ("monoamine oxidase inhibitor",),
+     "Monoamine oxidase inhibitor"),
     (r"tcas?|tricyclics?|tricyclic antidepressants?",
-     ("non selective monoamine reuptake inhibitors", "tricyclic antidepressant")),
+     ("non selective monoamine reuptake inhibitors", "tricyclic antidepressant"),
+     "Tricyclic antidepressant"),
     (r"antihypertensives?|blood pressure (?:drugs|medications|medicines|meds|pills)",
-     ("antihypertensives",)),
-    (r"antimalarials?", ("antimalarials",)),
-    (r"painkillers?|pain killers?|analgesics?", ("analgesics",)),
-    (r"antacids?", ("antacids",)),
-    (r"insulins?", ("insulins and analogues",)),
-    (r"contraceptives?|birth control(?: pills?)?", ("hormonal contraceptives for systemic use",)),
-    (r"vaccines?", ("vaccines",)),
+     ("antihypertensives",), "Antihypertensive"),
+    (r"antimalarials?", ("antimalarials",), "Antimalarial medication"),
+    (r"painkillers?|pain killers?|analgesics?", ("analgesics",), "Analgesic"),
+    (r"antacids?", ("antacids",), "Antacid"),
+    (r"insulins?", ("insulins and analogues",), "Insulin (medication)"),
+    (r"contraceptives?|birth control(?: pills?)?", ("hormonal contraceptives for systemic use",),
+     "Hormonal contraception"),
+    (r"vaccines?", ("vaccines",), "Vaccine"),
 ]
-_CLASS_ALIAS_RES = [(re.compile(r"\b(?:" + pat + r")\b"), subs) for pat, subs in CLASS_ALIASES]
+_CLASS_ALIAS_RES = [(re.compile(r"\b(?:" + pat + r")\b"), subs, wiki)
+                    for pat, subs, wiki in CLASS_ALIASES]
 
 # Condition → WHO ATC groups commonly used for it.
 CONDITIONS: List[Tuple[str, str, Tuple[str, ...]]] = [
@@ -986,7 +1065,7 @@ CONDITIONS: List[Tuple[str, str, Tuple[str, ...]]] = [
      r"runny nose|sinus\w*)\b", ("R01B", "R01A", "R06A")),
     ("pain", r"\b(?:pain|aches?|headaches?|toothache|backache|period pain|cramps)\b",
      ("N02B", "M01A", "N02A")),
-    ("fever", r"\bfevers?\b", ("N02B",)),
+    ("fever", r"(?<!hay )\bfevers?\b", ("N02B",)),
     ("migraine", r"\bmigraines?\b", ("N02C",)),
     ("allergies & hay fever", r"\b(?:allerg\w*|hay ?fever|itch\w*|hives|sneez\w*)\b",
      ("R06A", "R01AD")),
@@ -1064,7 +1143,7 @@ def find_classes(text: str) -> Tuple[List[str], str]:
     padded = f" {t} "
     slugs: List[str] = []
     phrase = ""
-    for rx, subs in _CLASS_ALIAS_RES:
+    for rx, subs, _wiki in _CLASS_ALIAS_RES:
         m = rx.search(t)
         if not m:
             continue
@@ -1100,6 +1179,74 @@ def find_condition(text: str) -> Optional[Tuple[str, List[str]]]:
             if present:
                 return label, present
     return None
+
+
+def find_class_mentions(text: str) -> List[Dict]:
+    """Every drug class named in `text`, in the order named: [{"phrase", "wiki",
+    "slugs", "span"}]. 'why not take NSAIDs with ACE inhibitors and diuretics'
+    names three — the first is what the question is about."""
+    t = _norm(text)
+    found: List[Dict] = []
+    for rx, subs, wiki in _CLASS_ALIAS_RES:
+        m = rx.search(t)
+        if not m or any(f["span"][0] <= m.start() < f["span"][1] for f in found):
+            continue
+        slugs = [slug for name, slug in _class_index() if any(s in name for s in subs)]
+        found.append({"phrase": m.group(0), "wiki": wiki, "slugs": slugs[:6],
+                      "span": [m.start(), m.end()]})
+    found.sort(key=lambda f: f["span"][0])
+    return found
+
+
+# ---------------------------------------------------------------------------
+# Concepts (concepts.json): pharmacology ideas, conditions and drug-reaction
+# syndromes a question can be about with no drug in it — 'what is first-pass
+# metabolism', 'drugs to avoid in G6PD deficiency' — answered from Wikipedia.
+# ---------------------------------------------------------------------------
+_CONCEPTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "concepts.json")
+
+
+@lru_cache(maxsize=1)
+def _concepts() -> List[Dict]:
+    try:
+        with open(_CONCEPTS_FILE, encoding="utf-8") as fh:
+            items = json.load(fh).get("concepts") or []
+    except Exception:  # noqa: BLE001 — the router still works without it
+        return []
+    out = []
+    for c in items:
+        try:
+            rxs = [re.compile(p) for p in c.get("patterns") or []]
+        except re.error:
+            continue                      # a bad pattern in the data file: skip the entry
+        if rxs and c.get("wiki"):
+            out.append(dict(c, _rxs=rxs))
+    return out
+
+
+def concept_by_id(cid: str) -> Optional[Dict]:
+    return next(({k: v for k, v in c.items() if k != "_rxs"} for c in _concepts()
+                 if c["id"] == cid), None)
+
+
+def find_concepts(t: str) -> List[Dict]:
+    """Concepts named in the (normalised, lower-case) question, file order —
+    specific entries come first in concepts.json, so 'CYP3A4 inhibitors' is
+    the CYP3A4 concept, not the generic 'enzyme inhibitors' one. A match that
+    overlaps an earlier one is dropped. Each: the entry + "span" + "text"."""
+    found: List[Dict] = []
+    for c in _concepts():
+        for rx in c["_rxs"]:
+            m = rx.search(t)
+            if not m or m.end() <= m.start():
+                continue
+            if any(m.start() < f["span"][1] and f["span"][0] < m.end() for f in found):
+                continue
+            entry = {k: v for k, v in c.items() if k != "_rxs"}
+            entry.update(span=[m.start(), m.end()], text=m.group(0))
+            found.append(entry)
+            break
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -1244,6 +1391,42 @@ def clip_query(raw: str) -> str:
     return raw[:half] + " … " + raw[-half:]
 
 
+# 'what is serotonin syndrome AND WHICH drugs cause it' is two questions: split
+# at '?', ';' or and/but/also + a new question word — never at a plain 'and'
+# ('ibuprofen and paracetamol together' stays one question).
+_SPLIT_RE = re.compile(
+    r"\?\s+|;\s+|,?\s+(?:and|also|plus|then|but)\s+(?=(?:how|why|what|what's|whats|which|when|where|"
+    r"who|is|are|does|do|can|could|should|will|would|did)\b)", re.I)
+_LEAD_CONJ_RE = re.compile(r"^(?:and|also|plus|then|but|so)\s+", re.I)
+
+
+def split_question(raw: str, max_parts: int = 3) -> List[str]:
+    """One message → its separate questions (at most `max_parts`); a single
+    question comes back as [it]. Fragments under three words stay with their
+    neighbour, so 'how and why does it work' is one question."""
+    raw = clip_query(raw)
+    parts = [_LEAD_CONJ_RE.sub("", p.strip(" ,;")) for p in _SPLIT_RE.split(raw)]
+    parts = [p for p in parts if p.strip(" ?!.")]
+    merged: List[str] = []
+    carry = ""
+    for p in parts:
+        if len(p.split()) < 3:
+            if merged and not carry:
+                merged[-1] = f"{merged[-1]} and {p}"
+            else:
+                carry = f"{carry} {p} and".strip()
+            continue
+        merged.append(f"{carry} {p}".strip() if carry else p)
+        carry = ""
+    if carry:
+        merged = merged or [carry.rsplit(" and", 1)[0]]
+    if len(merged) <= 1:
+        return [raw]
+    if len(merged) > max_parts:      # beyond the limit, the tail stays one last question
+        merged = merged[:max_parts - 1] + [" and ".join(merged[max_parts - 1:])]
+    return merged
+
+
 # A relationship question: an explicit link word, or why/how + a verb of use.
 _RELATION_RE = re.compile(
     r"\bantidotes?\b|\brevers(?:e|es|ed|ing|al)\b|"
@@ -1278,6 +1461,9 @@ def relation_target(raw: str, entities: List[Dict]) -> str:
     subj = entities[0].get("text") or entities[0].get("display") or ""
     if subj:
         target = re.sub(re.escape(subj), " ", target, flags=re.I)
+    # 'for c diff BUT iv for other infections' — the link is to the first part
+    target = re.split(r"\s+(?:but|whereas|while|although|though|instead of|rather than|"
+                      r"and (?:why|how|what|is|does|can))\s+", target, flags=re.I)[0]
     target = re.sub(r"\s+", " ", target).strip(" ?!.,;:\"'")
     target = re.sub(r"^(?:a|an|the|patients? with|people with|someone with)\s+", "", target, flags=re.I)
     words = {w.lower() for w in re.findall(r"[a-z]+", target, re.I)}
@@ -1448,13 +1634,172 @@ def template_match(text: str) -> Optional[Tuple[Dict, float, str]]:
     return best
 
 
+# Topics that make a class question about the CLASS ('how do statins work'),
+# not a request for its members ('list some statins').
+_TOPIC_INTENTS = frozenset({"mechanism", "pk", "uses", "dosing", "side_effects", "warnings",
+                            "interactions", "pregnancy", "population", "overdose", "legal",
+                            "history", "synthesis", "alternatives", "storage"})
+
+
+def _phrase_rx(phrase: str) -> re.Pattern:
+    """A class phrase as found in normalised text ('ace inhibitors') → a pattern
+    for the raw lower-case text, where punctuation may sit between the words."""
+    return re.compile(r"\b" + r"[\W_]+".join(re.escape(w) for w in phrase.split()) + r"\b")
+
+
+def _content_phrase(t2: str, extra: str = "") -> str:
+    """The words a drug-less question is about, in question order ('what is
+    hypertension' → 'hypertension'): question/topic words, fillers and the
+    'drugx' placeholder dropped. '' when nothing is left."""
+    found = _intent_matches(t2)
+    words = [w for w in _focus_terms(t2, found) if w != "drugx" and len(w) > 2]
+    for w in _TOKEN_RE.findall((extra or "").lower()):
+        if len(w) > 2 and w not in words and w not in STOPWORDS:
+            words.append(w)
+    return " ".join(words[:8])
+
+
+# Words that say what is asked about a concept, not what the concept is.
+_QWORDS = frozenset("""explain tell describe define definition mean means meaning please
+difference differences between example examples simple simply terms basically exactly""".split())
+
+
+def _concept_terms(t: str, concepts: List[Dict]) -> List[str]:
+    """The question's own content words outside the concept's words: 'what
+    drugs should be AVOIDED in G6PD deficiency' → ['drugs', 'avoided']; 'what
+    is first-pass metabolism' → [] (a definition is wanted)."""
+    chars = list(t)
+    for c in concepts:
+        s, e = c.get("span") or (0, 0)
+        for i in range(s, min(e, len(chars))):
+            chars[i] = " "
+    out: List[str] = []
+    for w in _TOKEN_RE.findall("".join(chars)):
+        if len(w) >= 3 and w not in STOPWORDS and w not in _QWORDS and w != "drugx" and w not in out:
+            out.append(w)
+    return out
+
+
+# Lay synonyms that name a TREATMENT ('pain' → analgesic, 'cough' →
+# antitussive): right for 'what helps a cough', wrong for 'why does X cause a
+# cough' — an explanation of an effect must talk about the effect.
+_TREATMENT_SYN_RE = re.compile(r"^anti|analges|relaxant|laxative|decongestant|bronchodilator|"
+                               r"anxiolytic|hypnotic|sedative|antitussive|mucolytic|expectorant|"
+                               r"triptan|pde5", re.I)
+# Medical words for effects people describe in lay terms (why-questions only).
+_EFFECT_SYNONYMS: Dict[str, Tuple[str, ...]] = {
+    "muscle": ("myalgia", "myopathy", "muscle"), "muscles": ("myalgia", "myopathy", "muscle"),
+    "cough": ("cough", "bradykinin"), "coughing": ("cough", "bradykinin"),
+    "weight": ("weight", "appetite", "satiety", "gastric emptying"),
+    "bleeding": ("bleeding", "hemorrhage", "haemorrhage"), "bleed": ("bleeding", "hemorrhage"),
+    "drowsy": ("drowsiness", "sedation", "somnolence"), "sleepy": ("drowsiness", "sedation"),
+    "hair": ("hair", "alopecia"), "gums": ("gingival",), "gum": ("gingival",),
+}
+
+
+# Topics whose own answer doesn't explain a why ('why does warfarin have so
+# many interactions' — the list isn't the reason). 'Why is warfarin dangerous'
+# is NOT here: its warnings answer leads with the boxed warning, which is the why.
+_WHY_ALONE_TOPICS = frozenset({"interactions", "pk", "dosing", "pregnancy"})
+
+
+def _why_target(focus: List[str], intents: List[str],
+                any_topic: bool = False) -> Tuple[str, List[str]]:
+    """For a why-question: (what is being explained, words that also count as
+    talking about it). 'why does warfarin have so many interactions' →
+    ('interactions', [CYP…, protein binding…]). A topic with no other words
+    counts only for `_WHY_ALONE_TOPICS` (or `any_topic`, for classes, which
+    have no per-topic answers to fall back on)."""
+    words = [f for f in focus if f != "drugx"]
+    topics = [i for i in intents if i in _WHY_TOPIC_TERMS]
+    if not words and not any(any_topic or i in _WHY_ALONE_TOPICS for i in topics):
+        return "", []
+    target = " ".join(words) or _WHY_TOPIC_PHRASE.get(topics[0], topics[0])
+    terms = [s for i in topics for s in _WHY_TOPIC_TERMS[i]]
+    for w in words:
+        terms += [s for s in LAY_SYNONYMS.get(w, ()) if not _TREATMENT_SYN_RE.search(s)]
+        terms += list(_EFFECT_SYNONYMS.get(w, ()))
+    return target, list(dict.fromkeys(terms))
+
+
+def _concept_result(out: Dict, concepts: List[Dict], intents: List[str], focus: List[str],
+                    class_ments: List[Dict], terms: List[str], query: str = "") -> Dict:
+    """A question whose subject is a concept, not a medicine. `terms` = what is
+    asked about it ('drugs', 'avoided'); none means a definition is wanted."""
+    focus = list(dict.fromkeys(focus + [c["phrase"] for c in class_ments]))
+    out.update(mode="concept", concepts=concepts, concept_query=query,
+               intents=[i for i in intents if i not in ("overview", "search")],
+               focus=focus, class_mentions=class_ments, concept_terms=terms)
+    if out["form"] == "why":
+        target, extra = _why_target(focus, intents, any_topic=True)
+        out["relation_target"], out["relation_terms"] = target, extra
+    return out
+
+
+def _class_result(out: Dict, ments: List[Dict], t: str, t2: str,
+                  leftover_runs, force_topic: bool = False, extra_focus=()) -> Optional[Dict]:
+    """A question whose subject is a drug class: about the class itself
+    (mode class_topic: 'how do SSRIs work', 'why do ACE inhibitors cause a dry
+    cough', 'which beta blockers are cardioselective') or asking for its
+    members (class_list: 'list some statins'). None = not a class question
+    after all (a condition list or an unknown drug in a membership question)."""
+    first = ments[0]
+    # 'is Ozempic a GLP-1 agonist' — the unknown word is a medicine to look up
+    if leftover_runs and re.search(r"\b(?:is|are)\s+\S+\s+(?:an?\s+|one of the\s+)?(?:\w+\s+){0,3}?"
+                                   + _phrase_rx(first["phrase"]).pattern, t):
+        return None
+    t_cls = t2
+    for m in ments:
+        t_cls = _phrase_rx(m["phrase"]).sub("drugx", t_cls)
+    found = _intent_matches(t_cls)
+    intents = _select_intents(found)
+    focus = [f for f in _focus_terms(t_cls, found) if f != "drugx"]
+    focus += [w for w in extra_focus if w not in focus]
+    # unknown words next to a class name are what's asked about it
+    # ('which beta blockers are CARDIOSELECTIVE')
+    for r in leftover_runs:
+        for w in _TOKEN_RE.findall(t[r[0]:r[1]]):
+            if w not in focus:
+                focus.append(w)
+    form = _qb.question_form(t_cls) if _qb else out["form"]
+    topical = set(intents) & _TOPIC_INTENTS
+    cond = find_condition(t)
+    if (not force_topic and cond and _CONDITION_TRIGGER_RE.search(t) and not topical
+            and form not in ("why", "how")):
+        return None              # 'best antihistamine for hay fever': the condition list
+    members = bool(_MEMBERS_RE.search(t_cls)) and not topical and form not in ("why", "how")
+    plain = not topical and not focus and form in ("what", "statement", "list", "which")
+    if not force_topic and (members or plain):
+        out.update(mode="class_list", class_slugs=first["slugs"], class_phrase=first["phrase"],
+                   class_mentions=ments, intents=intents, focus=focus)
+        return out
+    out.update(mode="class_topic", class_slugs=first["slugs"], class_phrase=first["phrase"],
+               class_mentions=ments, intents=[i for i in intents if i != "search"] or ["overview"],
+               focus=focus, form=form)
+    if form == "why":
+        target, terms = _why_target(focus, intents, any_topic=True)
+        # 'why not take NSAIDs with ACE inhibitors and diuretics' — the other
+        # classes are what the first one is being linked to
+        others = [m["phrase"] for m in ments[1:]]
+        if others:
+            target = target or " and ".join(others)
+            terms += others
+        out["relation_target"], out["relation_terms"] = target, list(dict.fromkeys(terms))
+    return out
+
+
 def parse_query(raw: str, context: Optional[Dict] = None) -> Dict:
     """Parse one chat message.
 
-    `context` is the previous turn: {"entity": {...}, "intents": [...]}.
+    `context` is the previous turn: {"entity": {...}, "intents": [...],
+    "concepts": [...], "class_mentions": [...]}.
     Returns a dict (stored in session state, so plain data only):
-      mode       answer | compare | interaction | multi | class_list | condition |
-                 clarify | unknown | help | thanks | empty
+      mode       answer | compare | interaction | multi | relation | class_list |
+                 class_topic | concept | condition | clarify | unknown | help |
+                 thanks | empty  (+ the safety modes crisis | refuse | pets)
+      concepts   concepts.json entries the question names (with a drug: those
+                 answered as concepts — 'therapeutic index of digoxin')
+      class_mentions  drug classes named, first = the subject
       entities   [{"kind", "query", "display", ...}]  — what to look up
       intents    ordered intent names (see INTENT_TITLES)
       focus      content words to rank sentences by ("coughing")
@@ -1490,11 +1835,19 @@ def parse_query(raw: str, context: Optional[Dict] = None) -> Dict:
         out["urgent"] = bool(_PET_URGENT_RE.search(t))
         return out
 
+    # ---- concepts (concepts.json): 'first-pass metabolism', 'G6PD deficiency' ----
+    concepts = find_concepts(t)
+
     # ---- spans that can't be part of a drug name ----
     blocked = [False] * len(t)
     for m in _CLASS_MASK_RE.finditer(t):
         for i in range(m.start(), m.end()):
             blocked[i] = True
+    # 'SEROTONIN syndrome', 'PENICILLIN allergy': the condition is the subject
+    for c in concepts:
+        if c.get("priority") == "high":
+            for i in range(*c["span"]):
+                blocked[i] = True
 
     entities: List[Dict] = []
     weak: List[Dict] = []
@@ -1605,13 +1958,30 @@ def parse_query(raw: str, context: Optional[Dict] = None) -> Dict:
     entities = uniq
 
     # ---- intents ----
+    # A concept's own words aren't topic cues ('THERAPEUTIC index of digoxin'
+    # is not a question about uses). With a drug in play (named, or carried
+    # over by 'its'), only concepts answered AS concepts are blanked out —
+    # 'half-life of diazepam' stays a pharmacokinetics question.
+    drug_in_play = bool(entities) or (bool((context or {}).get("entity")) and bool(
+        _PRONOUN_RE.search(t) or _FOLLOW_ON_RE.search(t.strip())))
+    # 'defer_if' (concepts.json): 'is ibuprofen metabolised by CYP3A4' is a
+    # metabolism question, which the pharmacokinetics answer covers
+    masked = [c for c in concepts
+              if (not drug_in_play or (c.get("with_drug") == "concept"
+                                       and not (c.get("defer_if") and re.search(c["defer_if"], t))))
+              and not any(c["span"][0] < en["span"][1] and en["span"][0] < c["span"][1]
+                          for en in entities)]
     t2 = t
+    for c in masked:                       # same length, so entity spans stay valid
+        s, e = c["span"]
+        t2 = t2[:s] + " " * (e - s) + t2[e:]
     for en in sorted(entities + (weak if not entities else []), key=lambda x: -x["span"][0]):
         s, e = en["span"]
         t2 = t2[:s] + "drugx" + t2[e:]
     found = _intent_matches(t2)
     intents = _select_intents(found)
     focus = _focus_terms(t2, found)
+    out["concepts"] = masked
 
     out["form"] = _qb.question_form(t2) if _qb else ""
     # 'how long do the side effects last' asks about side effects, not PK (the
@@ -1653,6 +2023,13 @@ def parse_query(raw: str, context: Optional[Dict] = None) -> Dict:
     for decisive in ("storage", "alternatives"):
         if decisive in intents:
             intents = [decisive] + [x for x in intents if x != decisive]
+    # 'how long after taking omeprazole can I eat' is about taking it around
+    # meals — not an interaction list, not a half-life
+    if re.search(r"\bhow (?:long|soon) (?:after|before)\b[^?.!]{0,50}\b(?:eat|eating|food|meals?|breakfast|"
+                 r"lunch|dinner)\b|\b(?:wait|leave) (?:\w+ ){0,4}(?:before|after) (?:eating|food|meals?|"
+                 r"breakfast)\b|\bcan i (?:eat|have (?:food|breakfast|a meal)) (?:right |straight |soon |"
+                 r"immediately )?(?:after|before)\b", t2):
+        intents = ["dosing"] + [x for x in intents if x not in ("dosing", "interactions", "pk")]
 
     # 'allergic to penicillin — can I take amoxicillin?': the allergen is not a
     # second subject; the question is about the other drug's warnings
@@ -1689,9 +2066,15 @@ def parse_query(raw: str, context: Optional[Dict] = None) -> Dict:
     if "pk" in intents:
         out["pk_facts"] = [lbl for lbl, rx in _PK_FACT_RES if rx.search(t)]
 
+    # 'long-term side effects' is about side effects, not how long to take it
+    if re.search(r"\blong[- ]term (?:side[- ]?)?(?:effects?|risks?|problems?|damage)\b", t):
+        intents = [x for x in intents if x != "dosing"] or intents
+
     # phrasings the keyword rules miss: the nearest example in the question
-    # bank decides (see question_bank.json — add a phrasing there to teach it)
-    if USE_TEMPLATE_MATCHER:
+    # bank decides (see question_bank.json — add a phrasing there to teach it).
+    # Not when a concept is the topic: with its words blanked out, 'is X safe
+    # in G6PD deficiency' looks like the bank's 'is X safe in pregnancy'.
+    if USE_TEMPLATE_MATCHER and not (drug_in_play and masked):
         t_match = t2
         if "drugx" not in t_match and (context or {}).get("entity"):
             t_match = _PRONOUN_RE.sub("drugx", t_match)
@@ -1751,12 +2134,18 @@ def parse_query(raw: str, context: Optional[Dict] = None) -> Dict:
     follow_on = bool(_FOLLOW_ON_RE.search(t.strip()))
 
     real_intents = [x for x in intents if x != "overview"]
-    # A class name ('statins', 'benzodiazepines') is not an unknown chemical.
+    # A class name ('statins', 'benzodiazepines') is not an unknown chemical —
+    # nor is any of several classes named ('NSAIDs with ACE inhibitors and
+    # diuretics'), nor a word inside a concept ('zero-order KINETICS').
     cls_all, phrase_all = find_classes(t)
-    if cls_all and phrase_all:
-        ph = {stem(w) for w in _norm(phrase_all).split()}
+    class_ments = find_class_mentions(t)
+    if class_ments:
+        ph = {stem(w) for c in class_ments for w in _norm(c["phrase"]).split()}
         leftover_runs = [r for r in leftover_runs
                          if not {stem(w) for w in _norm(t[r[0]:r[1]]).split()} <= ph]
+    if concepts:
+        leftover_runs = [r for r in leftover_runs
+                         if not any(c["span"][0] < r[1] and r[0] < c["span"][1] for c in concepts)]
 
     def _free_entity(run) -> Dict:
         s, e = run
@@ -1779,28 +2168,67 @@ def parse_query(raw: str, context: Optional[Dict] = None) -> Dict:
             t2 = t2.replace(_normalize(extra["text"]), "drugx", 1)
     if not entities:
         use_ctx = bool(ctx_entity) and (has_pronoun or follow_on)
+        about_prev = (has_pronoun or follow_on) and not use_ctx and not leftover_runs
+        hi = [c for c in masked if c.get("priority") == "high"]
+        # 'PENICILLIN allergy' names a condition, not the penicillin class
+        class_ments = [m for m in class_ments if not any(m["phrase"] in c["text"] for c in masked)]
+        # 1. a concept is the subject: 'what is first-pass metabolism', 'drugs to
+        #    avoid in G6PD deficiency', 'which antibiotics are safe in a
+        #    penicillin allergy' (a class named alongside is what to look for)
+        if masked and not use_ctx and (hi or not class_ments):
+            return _concept_result(out, masked, intents, focus, class_ments,
+                                   _concept_terms(t, masked))
+        # 2. a drug class is the subject: 'how do SSRIs work', 'why do ACE
+        #    inhibitors cause a cough' — or its members: 'list some statins'
+        if class_ments and not use_ctx:
+            res = _class_result(out, class_ments, t, t2, leftover_runs,
+                                extra_focus=[w["display"].lower() for w in weak]
+                                + [c["text"] for c in masked])
+            if res is not None:
+                return res
         if weak and not leftover_runs:
             # 'is zinc good for colds' — the everyday substance IS the subject
             entities = weak[:1]
             weak = weak[1:]
         else:
-            cls, phrase = cls_all, phrase_all
             cond = find_condition(t)
             if cond and _CONDITION_TRIGGER_RE.search(t) and not leftover_runs and not use_ctx:
                 out.update(mode="condition", condition={"label": cond[0], "codes": cond[1]},
                            intents=intents, focus=focus)
                 return out
-            if cls and not leftover_runs and not use_ctx:
-                out.update(mode="class_list", class_slugs=cls, class_phrase=phrase,
-                           intents=intents, focus=focus)
-                return out
+            # 3. a follow-up about the concept / class asked about last time
+            #    ('what is serotonin syndrome' → 'which drugs cause it?')
+            prev_concepts = list((context or {}).get("concepts") or [])
+            prev_classes = list((context or {}).get("class_mentions") or [])
+            if about_prev and prev_concepts:
+                out["used_context"] = True
+                return _concept_result(out, prev_concepts, intents, focus, [],
+                                       _concept_terms(t, []))
+            if about_prev and prev_classes:
+                out["used_context"] = True
+                return _class_result(out, prev_classes, t, t2, [], force_topic=True)
             if leftover_runs and not use_ctx:
                 ent = _free_entity(max(leftover_runs, key=lambda r: r[1] - r[0]))
+                # 'Hashimoto's thyroiditis', 'zero-order kinetics': a condition or
+                # an idea, not a chemical to look up in PubChem
+                if _CONCEPT_WORD_RE.search(t[ent["span"][0]:ent["span"][1]].lower()) or \
+                        _CONCEPT_WORD_RE.search(" ".join(focus)):
+                    q = _content_phrase(t2, extra=ent["query"])
+                    return _concept_result(out, [], intents, focus, class_ments,
+                                           [w for w in _concept_terms(t, []) if w not in q.split()],
+                                           query=q)
                 entities = [ent]
                 focus = [f for f in focus if f not in _norm(ent["query"]).split()]
             elif ctx_entity and (real_intents or has_pronoun or follow_on):
                 entities = [dict(ctx_entity)]
                 out["used_context"] = True
+            elif _content_phrase(t2) and _MEDICAL_HINT_RE.search(_content_phrase(t2)):
+                # 'what is hypertension', 'explain receptor up-regulation' — no
+                # medicine named, but something (medical) to look up
+                q = _content_phrase(t2)
+                return _concept_result(out, [], intents, focus, class_ments,
+                                       [w for w in _concept_terms(t, []) if w not in q.split()],
+                                       query=q)
             elif real_intents:
                 out.update(mode="clarify", intents=intents, focus=focus)
                 return out
@@ -1838,21 +2266,38 @@ def parse_query(raw: str, context: Optional[Dict] = None) -> Dict:
     if cls:
         focus = [f for f in focus if f not in _norm(phrase).split()]
 
+    # a concept asked about a named drug: 'therapeutic index of digoxin', 'is
+    # codeine a prodrug', 'zero-order kinetics of phenytoin'
+    drug_concepts = [c for c in masked if c.get("with_drug") == "concept"] if entities else []
+    if drug_concepts:
+        intents = ["concept"] + [x for x in intents if x not in ("concept", "overview", "search")]
+    out["concepts"] = drug_concepts if entities else masked
+
     strong = entities[:3]
     # 'why is glucagon the antidote for beta-blocker overdose' / 'how does
     # naloxone reverse morphine' — a question about the LINK between a drug and
     # something else, not about one topic of the drug
     rel = relation_target(raw, strong) if strong and not _COMPARE_RE.search(t2) else ""
+    derived = False
+    if (not rel and len(strong) == 1 and out["form"] == "why" and not drug_concepts
+            and not out["interactant"] and not _COMPARE_RE.search(t2)):
+        # any other why-question about one drug ('why does warfarin have so
+        # many interactions', 'why is amlodipine making my ankles swell'):
+        # rank the sentences that EXPLAIN that topic, not the topic's list
+        rel, terms = _why_target(focus, intents)
+        if rel:
+            out["relation_terms"], derived = terms, True
     if rel:
-        out.update(mode="relation", relation_target=rel, entities=strong[:1], weak=weak,
-                   intents=intents or ["overview"], focus=focus)
+        out.update(mode="relation", relation_target=rel, relation_derived=derived,
+                   relation_concepts=find_concepts(_normalize(rel)), entities=strong[:1],
+                   weak=weak, intents=intents or ["overview"], focus=focus)
         return out
     if len(strong) >= 2:
         others = [x for x in intents if x not in ("overview", "warnings")]
         if _COMPARE_RE.search(t2):
             out["mode"] = "compare"
             intents = intents or ["overview"]
-        elif "interactions" in intents or (not others and _CONNECT_RE.search(t2)):
+        elif "interactions" in intents or _COUSE_RE.search(t2) or (not others and _CONNECT_RE.search(t2)):
             out["mode"] = "interaction"
             intents = ["interactions"]
         else:

@@ -672,6 +672,7 @@ if HAS_STREAMLIT:
         "wikidata": (cs.wikidata_by_inchikey, ("query.wikidata.org",), None),
         "wiki_title": (cs.wikipedia_title_by_inchikey, ("query.wikidata.org",), None),
         "wiki_sections": (cs.wikipedia_sections, (cs.WIKI_API,), None),
+        "wiki_search": (cs.wikipedia_search, (cs.WIKI_API,), None),
         "parent_cid": (cs.pubchem_parent_cid, (cs.PUBCHEM_BASE,), None),
         "openfda_label": (lambda name, route="": cs.openfda_label(generic_name=name,
                                                                    main_route=route),
@@ -739,6 +740,7 @@ if HAS_STREAMLIT:
     cached_wikidata = _fetcher("wikidata", dict)
     cached_wiki_title = _fetcher("wiki_title", "")
     cached_wiki_sections = _fetcher("wiki_sections", dict)
+    cached_wiki_search = _fetcher("wiki_search", list)
     cached_parent_cid = _fetcher("parent_cid", None)
     cached_openfda_label = _fetcher("openfda_label", dict)
     cached_openfda_events = _fetcher("openfda_events", list)
@@ -4306,6 +4308,11 @@ def load_compound(input_text: str, chosen: Dict[str, Any], source: Optional[str]
     }
 
 
+_PHYSIOLOGY_LEAD_RE = re.compile(r"\b(?:hormone|neurotransmitter|neuromodulator|peptide|"
+                                 r"endogenous|catecholamine|neuropeptide|vitamin|amino acid)\b", re.I)
+_MEDICATION_LEAD_RE = re.compile(r"\b(?:medication|drug|used to treat|used in the treatment)\b", re.I)
+
+
 def _prefer_medication_article(secs: Dict[str, Any], wiki: Dict[str, Any]
                                ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Wikipedia splits some substances into a physiology article and a drug
@@ -4315,6 +4322,12 @@ def _prefer_medication_article(secs: Dict[str, Any], wiki: Dict[str, Any]
     (sections and lead summary) whenever it exists."""
     title = (secs or {}).get("title") or ""
     if not title or title.endswith("(medication)"):
+        return secs, wiki
+    # only a physiology article ('Glucagon is a peptide HORMONE…') has a separate
+    # drug article — checking every medicine cost a Wikipedia request each, and
+    # Wikimedia throttles this client after ~20 requests a minute
+    lead = (secs.get("lead") or "")[:400]
+    if not (_PHYSIOLOGY_LEAD_RE.search(lead) and not _MEDICATION_LEAD_RE.search(lead[:200])):
         return secs, wiki
     med = cached_wiki_sections(f"{title} (medication)")
     if not (med and med.get("sections")) or med.get("title") == title:
@@ -4979,7 +4992,7 @@ _INTENT_ICON = {
     "population": "👪", "overdose": "☠️", "brands": "🏷", "class": "🗂",
     "alternatives": "🔁", "identifiers": "🆔", "structure": "🧪", "properties": "📊",
     "spectra": "📈", "history": "📜", "synthesis": "🏭", "legal": "⚖️", "storage": "📦",
-    "cost": "💲", "ingredients": "🧾", "search": "🔎",
+    "cost": "💲", "ingredients": "🧾", "concept": "📘", "search": "🔎",
 }
 _CHAT_EXAMPLES = [
     "How does dextromethorphan stop me from coughing?",
@@ -6305,6 +6318,36 @@ _CHILD_RE = re.compile(r"\b(?:child|children|pediatric|paediatric|infant|adolesc
 _ELDER_RE = re.compile(r"\b(?:geriatric|elderly|older (?:adults?|patients)|65 years)\b", re.I)
 
 
+# A dosing question about HOW/WHEN to take it rather than how much.
+_PRACTICAL_DOSE_Q_RE = re.compile(r"\b(?:eat|eating|food|meals?|breakfast|lunch|dinner|empty stomach|"
+                                  r"bedtime|morning|night|evening|crush\w*|chew\w*|split\w*|swallow\w*|"
+                                  r"open (?:the )?capsules?|dissolve)\b", re.I)
+_FOOD_Q_RE = re.compile(r"\b(?:eat|eating|food|meals?|breakfast|lunch|dinner|empty stomach)\b", re.I)
+# A sentence that places a dose relative to a meal ('take before meals',
+# '30 minutes before breakfast', 'on an empty stomach').
+_MEAL_TIMING_RE = re.compile(
+    r"\b(?:before|after|with|without|between|prior to|following)\b[^.;]{0,25}\b(?:meals?|food|eating|"
+    r"breakfast|lunch|dinner|fasting)\b|\bempty stomach\b|\bminutes? (?:before|after)\b", re.I)
+
+
+def _meal_timing_items(ctx: Dict[str, Any]) -> List[Tuple[str, str, str]]:
+    """The label's own lines about taking the medicine around food, label first,
+    shortest (most direct) first."""
+    docs = [d for d in _chat_corpus(ctx)
+            if d["topic"] in ("dosing", "interactions", "pk") and _MEAL_TIMING_RE.search(d["text"])]
+    docs.sort(key=lambda d: (d["src"] != "FDA label", d["topic"] != "dosing", len(d["text"])))
+    out, dd = [], _SentenceDeduper()
+    for d in docs:
+        ws = _content_words(d["text"])
+        if dd.is_dup(ws) or dd.is_restatement(ws):
+            continue
+        dd.accept(ws)
+        out.append((d["text"], d["src"], d["url"]))
+        if len(out) >= 4:
+            break
+    return out
+
+
 def _ans_dosing(ctx, name, p):
     of = ctx.get("label") or {}
     blocks: List[Dict[str, Any]] = []
@@ -6317,6 +6360,16 @@ def _ans_dosing(ctx, name, p):
             items = items[1:]
         blocks += _pts(items, title=title, cap=3)
 
+    # 'how long after taking omeprazole can I eat', 'take it at night?': how to
+    # take it is the question — the dose tables and capsule descriptions aren't
+    practical = (p.get("form") == "when"
+                 or bool(_PRACTICAL_DOSE_Q_RE.search(p.get("raw") or "")))
+    if practical:
+        items = (_meal_timing_items(ctx) if _FOOD_Q_RE.search(p.get("raw") or "") else
+                 _relevant(ctx, list(p.get("focus") or []) + ["administration", "swallow", "bedtime",
+                                                               "morning", "evening"],
+                           topics={"dosing"}, k=4))
+        _lead(items, "How to take it (FDA label)", "")
     if p.get("focus"):
         _lead(_relevant(ctx, p["focus"], topics={"dosing"}, k=3),
               f"About “{_focus_label(p)}”", "")
@@ -6327,12 +6380,13 @@ def _ans_dosing(ctx, name, p):
         _lead(_label_points(of, "geriatric_use") + _label_points(of, "dosage", only=_ELDER_RE),
               "For older adults (FDA label)", "More for older adults")
     dose = _label_points(of, "dosage")
-    if dose and not any(b.get("t") == "answer" for b in blocks):
+    if dose and not practical and not any(b.get("t") == "answer" for b in blocks):
         blocks += _answer_box(dose[:1], label="Dosage (FDA label)")
         dose = dose[1:]
-    blocks += _pts(dose, title="More dosing detail (FDA label)", cap=4,
+    blocks += _pts(dose, title="More dosing detail (FDA label)", cap=0 if practical else 4,
                    more="Full dosing section")
-    blocks += _pts(_label_points(of, "dosage_forms"), title="Forms & strengths", cap=3)
+    if not practical:
+        blocks += _pts(_label_points(of, "dosage_forms"), title="Forms & strengths", cap=3)
     note = _label_product_note(of)
     if note and blocks:
         blocks.insert(0, _b("caption", v=note))
@@ -6499,6 +6553,10 @@ def _ans_interactions(ctx, name, p, other=None):
     if target:
         hits = _mentions(ctx, terms, topics={"interactions", "warnings", "side_effects",
                                              "dosing", "pk", "pharma", "toxicity", "overdose"})
+        if p.get("form") == "why":
+            # 'why does clarithromycin interact with simvastatin' — the sentence
+            # that gives the reason (a strong CYP3A inhibitor…) first
+            hits.sort(key=lambda h: -min(3, len(_EXPLAIN_RE.findall(h[0]))))
         if hits:
             blocks += _answer_box(hits[:1], label=f"{name} + {target}")
             blocks += _pts(hits[1:], title=f"More from {name}'s sources", cap=3,
@@ -6575,6 +6633,32 @@ def _ans_population(ctx, name, p):
     return blocks
 
 
+_OD_TREAT_Q_RE = re.compile(r"\b(?:antidotes?|revers\w*|treat\w*|manag\w*|what to do|counteract\w*)\b", re.I)
+_ANTIDOTE_RE = re.compile(r"\bantidot\w*|\brevers(?:e|es|al|ed|ing)\b|\b(?:treated|treatment|managed|"
+                          r"management) (?:with|by|of|is|includes?)\b|\bcounteract\w*", re.I)
+
+
+def _antidote_items(ctx: Dict[str, Any]) -> List[Tuple[str, str, str]]:
+    """'what's the antidote for paracetamol overdose': the sources' own lines
+    about the antidote / treatment — 'antidote' sentences first, label first."""
+    docs = [d for d in _chat_corpus(ctx)
+            if d["topic"] in ("overdose", "toxicity", "warnings", "overview", "pharma", "uses",
+                              "side_effects")
+            and _ANTIDOTE_RE.search(d["text"])]
+    docs.sort(key=lambda d: (not re.search(r"antidot", d["text"], re.I), d["topic"] != "overdose",
+                             d["src"] != "FDA label", len(d["text"])))
+    out, dd = [], _SentenceDeduper()
+    for d in docs:
+        ws = _content_words(d["text"])
+        if dd.is_dup(ws) or dd.is_restatement(ws):
+            continue
+        dd.accept(ws)
+        out.append((d["text"], d["src"], d["url"]))
+        if len(out) >= 4:
+            break
+    return out
+
+
 def _ans_overdose(ctx, name, p):
     of = ctx.get("label") or {}
     blocks: List[Dict[str, Any]] = []
@@ -6582,8 +6666,15 @@ def _ans_overdose(ctx, name, p):
         blocks.append(_b("warning", v="If someone may have taken an overdose, call emergency "
                                       "services now (995 in Singapore) or a poison centre."))
     od = _label_points(of, "overdosage")
-    blocks += _answer_box(od[:1], label="Overdose (FDA label)")
-    blocks += _pts(od[1:], cap=3, more="More")
+    # 'what's the ANTIDOTE…', 'how is it TREATED' — that, before the generic text
+    treat = _antidote_items(ctx) if _OD_TREAT_Q_RE.search(p.get("raw") or "") else []
+    if treat:
+        blocks += _answer_box(treat[:2], label="Antidote & treatment")
+        blocks += _pts(treat[2:], cap=2, more="More")
+        blocks += _pts(od, title="Overdose (FDA label)", cap=0, more="Overdose section (FDA label)")
+    else:
+        blocks += _answer_box(od[:1], label="Overdose (FDA label)")
+        blocks += _pts(od[1:], cap=3, more="More")
     tox = [it for it in _topic_items(ctx, {"overdose", "toxicity"})
            if not (od and it[1] == "FDA label")]          # label lines already shown
     blocks += _pts(tox, title="Toxicity (PubChem / Wikipedia)", cap=0 if of else 6,
@@ -7312,6 +7403,43 @@ def _interactant_verdict(ctx, name, p):
                     hits[0])
 
 
+_PAIR_TOPICS = {"interactions", "warnings", "side_effects", "dosing", "pk", "pharma", "toxicity",
+                "overdose"}
+
+
+def _pair_verdict(ctx, name: str, other: str, terms: List[str],
+                  reverse_hits: List[Tuple[str, str, str]]) -> List[Dict[str, Any]]:
+    """Short answer for 'can I take A with/while on B': the most cautionary
+    sentence either drug's sources say about the other. Never 'Yes' — a source
+    that doesn't mention the pair isn't evidence the pair is safe."""
+    hits = [(h, name) for h in _mentions(ctx, terms, topics=_PAIR_TOPICS, k=8)]
+    hits += [(h, other) for h in reverse_hits]
+    n, o = _md_safe(name), _md_safe(other)
+    if not hits:
+        return _verdict(f"**No warning found** about {o} in {n}'s FDA label, PubChem or Wikipedia "
+                        f"text (nor about {n} in {o}'s) — that isn't proof the combination is safe. "
+                        "Ask a pharmacist.")
+
+    names_rx = re.compile(r"\b(?:" + "|".join(re.escape(x) for x in (name, other) if x) + r")\b", re.I)
+
+    def caution(h):
+        s = h[0][0]
+        sc = 3 if _STRONG_AVOID_RE.search(s) else (1 if _AVOID_RE.search(s) else 0)
+        sc += 1 if re.search(r"bleed|hemorrhag|haemorrhag|serotonin syndrome|QT|torsade|"
+                             r"rhabdomyolysis|respiratory depression|hypotension|toxicity", s, re.I) else 0
+        # naming BOTH medicines beats a class word ('…or anticoagulants')
+        sc += 1 if len({m.group(0).lower() for m in names_rx.finditer(s)}) >= 2 else 0
+        return sc
+    ranked = sorted(hits, key=lambda h: (-caution(h), h[0][1] != "FDA label", len(h[0][0])))
+    (top, whose) = ranked[0]
+    if caution(ranked[0]) > 0:
+        where = f"{_md_safe(whose)}'s FDA label" if top[1] == "FDA label" else top[1]
+        return _verdict(f"**Caution — {where} warns about taking {n} with {o}.** Check with a "
+                        "pharmacist or doctor before combining them.", top)
+    return _verdict(f"**The sources mention {n} with {o}** — no explicit warning in the wording, "
+                    "but read it in context:", top)
+
+
 def _class_member_verdict(ctx, name, p):
     slugs = p.get("class_slugs") or []
     phrase = p.get("class_phrase") or ""
@@ -7786,6 +7914,12 @@ def direct_answer(ctx, name, p) -> List[Dict[str, Any]]:
     intents = p.get("intents") or []
     primary = intents[0] if intents else ""
     form = p.get("form") or ""
+    # several medicines in one yes/no question: a per-drug 'Yes — approved
+    # for headache' answers a question nobody asked (the combination)
+    if p.get("mode") == "multi" and form == "yes_no" and primary in ("uses", "dosing", "brands"):
+        return []
+    if primary == "concept":
+        return []                                # the concept section leads with the quote
     try:
         if p.get("allergen") and primary == "warnings":
             return _allergy_verdict(ctx, name, p)
@@ -7887,7 +8021,7 @@ _INTENT_BUILDERS = {
                           skip_label=True),
     "cost": _ans_cost, "ingredients": _ans_ingredients,
     "search": _ans_search,
-}
+}                                   # + "concept" (registered after _ans_concept below)
 
 
 def _intent_heading(intent: str, name: str) -> str:
@@ -7969,6 +8103,9 @@ def _answer_for(ctx, entity, p, opts, compact=False) -> List[Dict[str, Any]]:
             part = _fallback_blocks(ctx, name, p, intent)
         if intent == "mechanism" and re.search(r"pharmacodynamic", p.get("raw") or "", re.I):
             blocks.append(_b("md", v=f"#### 🧬 Pharmacodynamics of {_md_safe(name)}"))
+        elif intent == "concept" and p.get("concepts"):
+            blocks.append(_b("md", v=f"#### 📘 {_md_safe(name)}: "
+                                     f"{_md_safe(p['concepts'][0].get('label') or '')}"))
         elif intent != "overview" or len(p["intents"]) > 1 or compact:
             blocks.append(_b("md", v=_intent_heading(intent, name)))
         blocks += part
@@ -8570,24 +8707,64 @@ def relation_core(target: str) -> str:
     return " ".join(words) or target
 
 
+# Wording that states a CAUSE ('is caused by', 'because ACE also degrades
+# bradykinin') — stronger evidence for a why-question than verbs like
+# 'increases' that _EXPLAIN_RE also counts.
+_CAUSAL_RE = re.compile(
+    r"\b(?:because|due to|caused by|is caused|are caused|results? (?:from|in)|resulting in|"
+    r"(?:is|are) (?:thought|believed|considered) to|attributed to|mediated by|leads? to|"
+    r"as a result|owing to|the reason|accumulat\w*|thereby|which (?:in turn|leads|causes|results)|"
+    r"responsible for|explain\w*)\b", re.I)
+# How to avoid or treat the effect — the next question, not the why.
+_REMEDY_RE = re.compile(r"\bcan be (?:avoided|prevented|reduced|minimi[sz]ed|treated|managed|"
+                        r"reversed)\b|\b(?:are|is) (?:often |usually )?switched to\b|"
+                        r"\bavoided by\b|\bmanaged by\b", re.I)
+# A sentence that only makes sense with the one before it ('This mechanism…').
+_ANAPHOR_START_RE = re.compile(r"^(?:This|These|That|Those|Such|It|Thus|Therefore|Hence|"
+                               r"Consequently|As a result)\b")
+
+
+def _with_antecedents(sents: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """(sentence, section) with each 'This mechanism can explain…' joined to the
+    sentence before it in the same section — alone it doesn't say what 'this' is."""
+    out = []
+    for i, (s, path) in enumerate(sents):
+        if i and _ANAPHOR_START_RE.match(s) and sents[i - 1][1] == path:
+            out.append((f"{sents[i - 1][0]} {s}", path))
+        else:
+            out.append((s, path))
+    return out
+
+
 def score_relation_sentence(text: str, subj_re: Optional[re.Pattern],
-                            tgt_re: re.Pattern, question: str) -> float:
+                            tgt_re: re.Pattern, question: str, cause_first: bool = False) -> float:
     """How well a sentence explains the subject↔target link (0 = unusable).
-    Must mention the target; both sides, explanatory wording and the question's
-    own cue words (antidote, overdose…) raise it; interaction warnings sink it."""
+    Must mention the target; both sides, explanatory wording (a stated cause
+    most) and the question's own cue words (antidote, overdose…) raise it;
+    interaction warnings and advice on avoiding the effect sink it.
+    `cause_first`: a why-question about an effect or a topic ('why is
+    amlodipine making my ankles swell') — mechanism words in a sentence about
+    PREVENTING the effect ('…avoided by adding ACE inhibitors') are not a
+    reason, so a stated cause outweighs them."""
     if not tgt_re.search(text):
         return 0.0
     score = 1.0
     if subj_re is not None and subj_re.search(text):
         score += 2.0
-    score += min(3, len(_EXPLAIN_RE.findall(text))) * 1.2
+    causal = bool(_CAUSAL_RE.search(text))
+    if cause_first:
+        score += min(1, len(_EXPLAIN_RE.findall(text))) * 1.0 + (3.0 if causal else 0.0)
+    else:
+        score += min(3, len(_EXPLAIN_RE.findall(text))) * 1.2 + (1.5 if causal else 0.0)
     for cue in set(m.lower()[:6] for m in _REL_QUESTION_CUES.findall(question)):
         if re.search(re.escape(cue), text, re.I):
             score += 1.0
     if _REL_NOISE_RE.search(text):
         score -= 3.0
+    if _REMEDY_RE.search(text) and not causal:
+        score -= 3.0 if cause_first else 1.5
     if len(text) > 400:
-        score -= 1.0
+        score -= 0.5 if causal else 1.0
     return max(score, 0.0)
 
 
@@ -8602,35 +8779,72 @@ def _wiki_sentences(secs: Dict[str, Any]) -> List[Tuple[str, str]]:
     return out
 
 
+def _drug_class_articles(ctx: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """[(Wikipedia title, class phrase)] for the drug's classes that have an
+    article in the router's class list (amlodipine → 'Calcium channel
+    blocker') — class-wide explanations live there, not in the drug's page."""
+    if cr is None:
+        return []
+    names = [_strip_class_tag(c) for c in (ctx.get("label") or {}).get("pharm_class_epc", [])]
+    drug = ctx.get("drug_hit")
+    if drug and HAS_DRUG_LIBRARY:
+        names += [dl.class_name(s) for s in drug.get("classes") or []]
+    out: List[Tuple[str, str]] = []
+    for n in names:
+        for m in cr.find_class_mentions(n):
+            if m["wiki"] not in [t for t, _ph in out]:
+                out.append((m["wiki"], m["phrase"]))
+    return out
+
+
 def relation_evidence(ctx: Dict[str, Any], subject: str, target: str,
-                      question: str) -> List[Tuple[float, str, str, str]]:
+                      question: str, extra_terms=(), other_titles=None, cause_first: bool = False
+                      ) -> List[Tuple[float, str, str, str]]:
     """Ranked [(score, sentence, source, url)] connecting the subject drug to
-    the target, from the drug's own sources, its full Wikipedia article and
-    the TARGET's Wikipedia article (e.g. 'Beta blocker' → its Overdose
-    section names glucagon)."""
+    the target, from the drug's own sources, its full Wikipedia article, the
+    TARGET's Wikipedia article (e.g. 'Beta blocker' → its Overdose section
+    names glucagon) and the drug's CLASS article. `extra_terms` widen what
+    counts as the target ('interactions' → CYP, protein binding…);
+    `other_titles` names the target's articles ([] = none, None = guess
+    from the target's words)."""
     tgt_re = relation_target_re(target)
+    if extra_terms:
+        tgt_re = _terms_re([target] + list(extra_terms)) or tgt_re
     if tgt_re is None:
         return []
     subj_re = _drug_names_re(ctx) or re.compile(r"\b" + re.escape(subject) + r"\b", re.I)
     cands: List[Tuple[str, str, str]] = []
     cands += [(d["text"], d["src"], d.get("url", "")) for d in _chat_corpus(ctx)]
     secs = ctx.get("wiki_secs") or {}
-    cands += [(s, "Wikipedia", secs.get("url", "")) for s, _h in _wiki_sentences(secs)]
+    cands += [(s, "Wikipedia", secs.get("url", ""))
+              for s, _h in _with_antecedents(_wiki_sentences(secs))]
     # the other side's article: sentences there must name the subject drug
-    core = relation_core(target)
-    other = cached_wiki_sections(core) or {}
-    if other and other.get("title") != secs.get("title"):
-        label = f"Wikipedia: {other.get('title')}"
-        cands += [(s, label, other.get("url", "")) for s, _h in _wiki_sentences(other)
-                  if subj_re.search(s)]
+    titles = [relation_core(target)] if other_titles is None else list(other_titles)
+    for title in titles[:2]:
+        other = cached_wiki_sections(title) or {}
+        if other and other.get("title") != secs.get("title"):
+            label = f"Wikipedia: {other.get('title')}"
+            cands += [(s, label, other.get("url", ""))
+                      for s, _h in _with_antecedents(_wiki_sentences(other)) if subj_re.search(s)]
+    # the drug's class article: sentences naming the drug or its class
+    for title, phrase in _drug_class_articles(ctx)[:1]:
+        other = cached_wiki_sections(title) or {}
+        cls_re = _terms_re([other.get("title", ""), phrase])
+        if other and other.get("title") != secs.get("title"):
+            label = f"Wikipedia: {other.get('title')}"
+            cands += [(s, label, other.get("url", ""))
+                      for s, _h in _with_antecedents(_wiki_sentences(other))
+                      if subj_re.search(s) or (cls_re is not None and cls_re.search(s))]
     scored = []
     dd = _SentenceDeduper()
     for text, src, url in cands:
         # DrugBank/PubChem citation codes glued on: '…pesticides.L42815,​L42835'
         text = re.sub(r"\.?\s*\b[LA]\d{4,6}(?:[,\s​]+[LA]\d{4,6})*\s*$", ".", text).strip()
-        sc = score_relation_sentence(text, subj_re, tgt_re, question)
+        sc = score_relation_sentence(text, subj_re, tgt_re, question, cause_first=cause_first)
         if sc <= 0:
             continue
+        if extra_terms:      # several of the topic's words: more squarely about it
+            sc += 0.4 * min(3, len({m.group(0).lower() for m in tgt_re.finditer(text)}) - 1)
         scored.append((sc, text, src, url))
     scored.sort(key=lambda x: -x[0])
     out = []
@@ -8656,12 +8870,25 @@ def _answer_relation(p, opts, blocks):
     name = _chat_name(ctx, en)
     blocks += loaded["notes"]
     _progress(opts, f"Looking for where the sources connect {name} and {target}…")
-    ev = relation_evidence(ctx, name, target, p.get("raw") or "")
-    blocks.append(_b("md", v=f"#### 🔗 {_md_safe(name)} ↔ {_md_safe(target)}"))
+    rel_concepts = p.get("relation_concepts") or []
+    # the target's own article: a known concept's ('lactic acidosis', 'C. diff'),
+    # none for a topic ('interactions'), else guessed from its words
+    others = ([c["wiki"] for c in rel_concepts] if rel_concepts
+              else [] if p.get("relation_derived") else None)
+    ev = relation_evidence(ctx, name, target, p.get("raw") or "",
+                           extra_terms=list(p.get("relation_terms") or [])
+                           + [t for c in rel_concepts for t in c.get("terms") or []],
+                           other_titles=others, cause_first=bool(p.get("relation_derived")))
+    if p.get("relation_derived"):
+        q = (p.get("raw") or "").strip().rstrip("?")
+        blocks.append(_b("md", v=f"#### 💡 {_md_safe(q[:1].upper() + q[1:])}?"))
+    else:
+        blocks.append(_b("md", v=f"#### 🔗 {_md_safe(name)} ↔ {_md_safe(target)}"))
     strong = [e for e in ev if e[0] >= 3.0]
     if strong:
         blocks += _answer_box([(t, s, u) for _sc, t, s, u in strong[:2]],
-                              label="What the sources say about the link")
+                              label="Why — what the sources say" if p.get("relation_derived")
+                              else "What the sources say about the link")
         blocks += _pts([(t, s, u) for _sc, t, s, u in strong[2:5]],
                        title="More from the sources", cap=2, more="More")
     elif ev:
@@ -8680,6 +8907,9 @@ def _answer_relation(p, opts, blocks):
                               for t, _tgt, _act in _chembl_mechs(ctx)]
     if mech:
         blocks += _pts(mech[:3], title=f"How {name} works", cap=3)
+    if "Wikipedia" in _sources_down(ctx):
+        blocks.append(_b("caption", v="⚠️ Wikipedia didn't respond just now, so explanations from its "
+                                      "articles may be missing — ask again in a minute."))
     blocks.append(_b("caption", v="Ask doesn't reason — it finds the sentences in the sources "
                                   "that connect the two and ranks the ones that explain *how* "
                                   "first. Follow the source tags to read them in context."))
@@ -8690,6 +8920,492 @@ def _answer_relation(p, opts, blocks):
                             ("📖 Full profile", _PROFILE_PREFIX + loaded["query"])]))
     return blocks, {"entity": {"kind": "free", "query": loaded["query"], "display": ref},
                     "intents": p.get("intents") or ["overview"]}
+
+
+# ---- concepts & drug classes, answered from their own Wikipedia articles ----
+# 'what is first-pass metabolism', 'drugs to avoid in G6PD deficiency', 'how do
+# SSRIs work', 'why do ACE inhibitors cause a dry cough': no single medicine to
+# look up, so the answer is the concept's / class's own article — the
+# sentences that address what was asked (its definition when nothing more
+# specific was), ranked like the relation answers: the question's words, the
+# section a sentence sits in, and wording that explains (because, by inhibiting…).
+
+# Section headings that hold each topic.
+_TOPIC_HEAD_RE = {
+    "mechanism": re.compile(r"mechanism|pharmacolog|pharmacodynam|mode of action|pathophysiolog", re.I),
+    "side_effects": re.compile(r"adverse|side effect|safety|toxicit|complication", re.I),
+    "warnings": re.compile(r"contraindicat|precaution|caution|warning|safety|adverse", re.I),
+    "pregnancy": re.compile(r"pregnan|lactation|breast|contraindicat", re.I),
+    "interactions": re.compile(r"interaction", re.I),
+    "uses": re.compile(r"medical use|^uses|indication|therapeutic use|clinical use|treatment", re.I),
+    "pk": re.compile(r"pharmacokinetic|metabolism|absorption|elimination|distribution|excretion", re.I),
+    "overdose": re.compile(r"overdose|toxicity|poisoning", re.I),
+    "dosing": re.compile(r"dos(?:e|age|ing)|administration", re.I),
+    "history": re.compile(r"history", re.I),
+}
+# What a question asks about a concept → the sections that answer it.
+_ASK_HEADS = [
+    (re.compile(r"\b(?:caus\w*|trigger\w*|precipitat\w*|risk factors?|avoid\w*|which (?:drugs|medicines|"
+                r"medications)|what (?:drugs|medicines|medications)|drugs? (?:that|which))\b", re.I),
+     r"cause|trigger|etiolog|aetiolog|risk|precipitat|drug|medication|pharmac"),
+    (re.compile(r"\b(?:treat\w*|manag\w*|therap\w*|antidote|revers\w*|cure\w*)\b", re.I),
+     r"treatment|management|therapy|antidote"),
+    (re.compile(r"\b(?:symptoms?|signs?|present\w*)\b", re.I), r"sign|symptom|presentation|clinical feature"),
+    (re.compile(r"\b(?:diagnos\w*|tests?|detect\w*)\b", re.I), r"diagnos"),
+    (re.compile(r"\bprevent\w*\b", re.I), r"prevent"),
+    (re.compile(r"\b(?:examples?|which|list|types?|main)\b", re.I),
+     r"example|type|classif|list|member|agent"),
+    (re.compile(r"\b(?:how does it (?:work|happen|occur|develop)|mechanism|pathophysiolog\w*)\b", re.I),
+     r"pathophysiolog|mechanism|cause"),
+]
+_DISAMBIG_RE = re.compile(r"\bmay (?:also )?refer to\b|\bmost commonly refers to\b", re.I)
+_DEFINITION_RE = re.compile(r"\b(?:is|are|was|refers? to|describes?|means?)\b", re.I)
+
+
+def _article_sents(secs: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """(sentence, 'Section › Subsection') for a whole article, lead first."""
+    out: List[Tuple[str, str]] = []
+    for s in _split_sentences(re.sub(r"\s+", " ", secs.get("lead") or "")):
+        if len(s) > 30:
+            out.append((s, ""))
+    for sec in secs.get("sections") or []:
+        path = " › ".join(list(sec.get("parents") or []) + [sec.get("heading", "")])
+        for line in (sec.get("text") or "").split("\n"):
+            for s in _split_sentences(line):
+                if len(s) > 30 and not _is_lowvalue_sentence(s):
+                    out.append((s, path))
+    return out
+
+
+def _definition(secs: Dict[str, Any], n: int = 2) -> List[str]:
+    """The article's opening sentences (its definition of the subject)."""
+    sents = [s for s in _split_sentences(re.sub(r"\s+", " ", secs.get("lead") or "")) if len(s) > 40]
+    return sents[:n]
+
+
+def _terms_re(words) -> Optional[re.Pattern]:
+    """Words/phrases → one tolerant pattern ('metaboli' also matches
+    'metabolised', 'beta blocker' also 'β-blocker')."""
+    parts = []
+    for w in words:
+        toks = re.findall(r"[A-Za-z0-9]+", w or "")
+        if not toks or (len(toks) == 1 and len(toks[0]) < 3):
+            continue
+        parts.append(r"[\s\-]*".join(_rel_word_rx(t) for t in toks))
+    return re.compile(r"\b(?:" + "|".join(dict.fromkeys(parts)) + r")", re.I) if parts else None
+
+
+_CONTINUATION_START_RE = re.compile(r"^(?:Conversely|However|In addition|Additionally|Also|Similarly|"
+                                    r"Likewise|Furthermore|Moreover|Alternatively|Otherwise|Instead|"
+                                    r"In contrast|By contrast)\b")
+
+
+# 'which drugs cause it', 'examples', 'first-line': the answer NAMES medicines.
+_NAMES_Q_RE = re.compile(r"\b(?:which|what) (?:\w+ )?(?:drugs|medicines|medications|antibiotics|agents|"
+                         r"ones)\b|\bexamples?\b|\bdrugs? (?:that|which)\b|\bfirst[- ]line\b|"
+                         r"\bwhich\b[^?.!]{0,40}\b(?:are|is)\b|\binhibitors\b|\binducers\b|\blist\b", re.I)
+
+
+def _named_drug_count(s: str) -> int:
+    """How many medicines (Drug Library names) and drug classes a sentence names."""
+    if cr is None:
+        return 0
+    lex = cr._lexicon()[0]
+    toks = set(re.findall(r"[a-z0-9]+", s.lower()))
+    n = sum(1 for w in toks if len(w) > 4 and not cr._is_common(w)
+            and (lex.get(w) or {}).get("kind") in ("library", "alias"))
+    return n + len(cr.find_class_mentions(s))
+
+
+def rank_article(sents: List[Tuple[str, str]], *, terms=(), heads: Optional[re.Pattern] = None,
+                 why: bool = False, subj_re: Optional[re.Pattern] = None,
+                 need_re: Optional[re.Pattern] = None, names: bool = False, k: int = 6
+                 ) -> List[Tuple[float, str, str]]:
+    """An article's sentences ranked for one question → [(score, sentence, path)].
+    `terms`: the question's own words (BM25, lay words expanded); `heads`:
+    section headings that answer it (a sentence there counts more, and with no
+    terms qualifies on its own); `why`: wording that explains counts;
+    `subj_re`: the subject's names (+0.5); `need_re`: a sentence must match it
+    (the thing a why-question asks about) — more distinct matches, higher;
+    `names`: the answer is a list of medicines, so naming them counts."""
+    if why:
+        sents = _with_antecedents(sents)
+    weights = cr.expand_terms(list(terms)) if terms and cr else {}
+    bm = dict(cr.rank([s for s, _p in sents], weights)) if weights else {}
+    # a question word that NAMES a section ('main CYP3A4 INHIBITORS' → the
+    # 'Inhibitors' section, not a substrate list that says 'pump inhibitor')
+    term_stems = {st for t in terms for st in (cr.tokens(t) if cr else []) if len(st) > 3}
+    first_of: Dict[str, int] = {}
+    for i, (_s, path) in enumerate(sents):
+        first_of.setdefault(path, i)
+    scored = []
+    for i, (s, path) in enumerate(sents):
+        if need_re is not None and not need_re.search(s):
+            continue
+        # for a why, restating the effect ('a dry cough is common') is not the
+        # answer — the question's words count less, a stated cause counts most
+        sc = bm.get(i, 0.0) * (0.5 if why else 1.0)
+        in_head = heads is not None and bool(heads.search(path or ""))
+        if in_head:
+            sc = sc * 1.6 if sc else (0.0 if weights and need_re is None else 1.0)
+        if sc and term_stems and cr and term_stems & set(cr.tokens(path or "")):
+            sc *= 1.8
+        opener = bool(sc and in_head and path and first_of.get(path) == i)
+        if opener:           # a section's opening line summarises it ('Management is based on…')
+            sc += 0.5 if " › " in path else 1.0
+        if sc and _CONTINUATION_START_RE.match(s):
+            sc *= 0.75       # 'Conversely, …' / 'However, …' — a detail of something said before
+        if need_re is not None:
+            sc += 1.0 + 0.6 * min(3, len({m.group(0).lower() for m in need_re.finditer(s)}))
+        if sc <= 0:
+            continue
+        if why:
+            sc += 0.6 * min(3, len(_EXPLAIN_RE.findall(s)))
+            sc += 1.5 if _CAUSAL_RE.search(s) else 0.0
+            sc -= 1.2 if _REMEDY_RE.search(s) and not _CAUSAL_RE.search(s) else 0.0
+        if subj_re is not None and subj_re.search(s):
+            sc += 0.5
+        if names:
+            sc += 0.4 * min(5, _named_drug_count(s))
+        if _RESEARCH_RE.search(s):
+            sc *= 0.6
+        if _REL_NOISE_RE.search(s):
+            sc *= 0.7
+        if len(s) > 400 and not opener:
+            sc *= 0.8
+        scored.append((sc, s, path))
+    scored.sort(key=lambda x: -x[0])
+    out, dd = [], _SentenceDeduper()
+    for sc, s, path in scored:
+        ws = _content_words(s)
+        if dd.is_dup(ws) or dd.is_restatement(ws):
+            continue
+        dd.accept(ws)
+        out.append((sc, s, path))
+        if len(out) >= k:
+            break
+    return out
+
+
+def _ask_heads(raw: str, intents: List[str]) -> Optional[re.Pattern]:
+    """Section headings that answer this question (from its wording/topics)."""
+    pats = [heads for rx, heads in _ASK_HEADS if rx.search(raw or "")]
+    pats += [_TOPIC_HEAD_RE[i].pattern for i in intents if i in _TOPIC_HEAD_RE]
+    return re.compile("|".join(dict.fromkeys(pats)), re.I) if pats else None
+
+
+def _content_terms(terms: List[str]) -> List[str]:
+    """Question words minus those that only pick the SECTION ('how is it
+    TREATED' → the Management section, whose opening line needn't say 'treat')."""
+    return [t for t in terms if not any(rx.search(t) for rx, _h in _ASK_HEADS)]
+
+
+def _search_article(query: str) -> Tuple[Dict[str, Any], List[str]]:
+    """(article, other candidate titles) for a free-text concept. A search hit
+    must share at least half of the query's words with its title — Wikipedia
+    search always returns *something*, and a loosely related page would be an
+    answer to a different question."""
+    hits = cached_wiki_search(query, 6) or []
+    qw = {cr.stem(w) for w in re.findall(r"[a-z0-9]+", query.lower())
+          if w not in cr.STOPWORDS and len(w) > 2} if cr else set()
+
+    def overlap(title: str) -> float:
+        tw = {cr.stem(w) for w in re.findall(r"[a-z0-9]+", title.lower())} if cr else set()
+        return len(qw & tw) / max(1, len(qw))
+
+    for h in sorted(hits, key=lambda h: -overlap(h["title"])):      # stable: search order breaks ties
+        if overlap(h["title"]) < 0.5:
+            break
+        secs = cached_wiki_sections(h["title"]) or {}
+        if secs and not _DISAMBIG_RE.search((secs.get("lead") or "")[:400]):
+            return secs, [x["title"] for x in hits if x["title"] != secs.get("title")][:3]
+    return {}, [h["title"] for h in hits[:3]]
+
+
+def _wsrc(secs: Dict[str, Any]) -> Tuple[str, str]:
+    """(source tag, link) for quoting an article."""
+    return f"Wikipedia: {secs.get('title', '')}", secs.get("url", "")
+
+
+def _section_items(secs: Dict[str, Any], path: str) -> List[str]:
+    """The lines of one section (by 'Parent › Heading' path)."""
+    for sec in secs.get("sections") or []:
+        if " › ".join(list(sec.get("parents") or []) + [sec.get("heading", "")]) == path:
+            return [ln.strip(" ,;•*-") for ln in (sec.get("text") or "").split("\n")
+                    if ln.strip(" ,;•*-")]
+    return []
+
+
+def _list_digests(secs: Dict[str, Any], ranked, raw: str, src: str, url: str
+                  ) -> List[Tuple[str, str, str]]:
+    """When the best matches are items of a LIST section ('Strong inhibitors':
+    one drug per line), one line per section — 'Strong inhibitors: A, B, C…' —
+    instead of scattered single items. 'Main/major/strong…' questions get the
+    strong/major list first."""
+    paths: List[str] = []
+    for _sc, _s, path in ranked:
+        items = _section_items(secs, path) if path else []
+        if path not in paths and len(items) >= 4 and sorted(len(x) for x in items)[len(items) // 2] < 90:
+            paths.append(path)
+    if not paths:
+        return []
+    if re.search(r"\b(?:main|major|most|strong\w*|potent|important|common|key)\b", raw, re.I):
+        paths.sort(key=lambda pth: not re.search(r"strong|major|potent|common|important", pth, re.I))
+    out = []
+    for pth in paths[:2]:
+        items = [re.sub(r"\s*\([^)]{25,}\)", "", it).strip(" ,;") for it in _section_items(secs, pth)]
+        items = [it for it in items if it and not it.endswith(":")]
+        out.append((f"**{pth.split(' › ')[-1]}:** " + ", ".join(items[:15])
+                    + (" …" if len(items) > 15 else ""), src, url))
+    return out
+
+
+def _class_members(slugs: List[str], limit: int = 30) -> List[str]:
+    if not HAS_DRUG_LIBRARY:
+        return []
+    names: List[str] = []
+    for slug in slugs[:3]:
+        for d in dl.drugs_in_class(slug):
+            if d["name"] not in names:
+                names.append(d["name"])
+    return names[:limit]
+
+
+def _answer_concept(p, opts) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """A question about a concept, condition or reaction — no medicine named."""
+    concepts = p.get("concepts") or []
+    articles: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
+    alts: List[str] = []
+    for c in concepts[:2]:
+        _progress(opts, f"Reading Wikipedia on {c.get('label') or c['wiki']}…")
+        secs = cached_wiki_sections(c["wiki"]) or {}
+        if secs:
+            articles.append((c.get("label") or secs.get("title", ""), secs, c))
+    if not concepts and p.get("concept_query"):
+        _progress(opts, f"Looking up “{p['concept_query']}”…")
+        secs, alts = _search_article(p["concept_query"])
+        if secs:
+            articles.append((secs.get("title", ""), secs, {}))
+    # what this question is about — kept as the chat's subject even if the
+    # article can't be loaded, so 'which drugs cause it?' doesn't fall back to
+    # an older question's subject
+    asked = [{k: v for k, v in x.items() if k not in ("span", "text")} for x in concepts]
+    if not asked and p.get("concept_query"):
+        asked = [{"id": "search", "label": p["concept_query"], "wiki": p["concept_query"], "terms": []}]
+    ctx_out = {"concepts": asked, "intents": p.get("intents") or []}
+    wiki_down = cs.host_failing(cs.WIKI_API)
+    if not articles:
+        what = (concepts[0].get("label") if concepts else p.get("concept_query")) or "that"
+        if wiki_down:
+            return [_b("warning", v=f"Wikipedia didn't respond just now (it limits bursts of requests), "
+                                    f"so I can't answer about “{_md_safe(what)}” — ask again in a "
+                                    "minute.")], ctx_out
+        blocks = [_b("info", v=f"I couldn't find a medicine in your question, or an encyclopedia "
+                               f"article on “{_md_safe(what)}”. Try naming a medicine, a drug class "
+                               "(e.g. *statins*) or a pharmacology term.")]
+        if alts:
+            blocks.append(_b("buttons", title="Did you mean:", items=[(a, f"What is {a}?") for a in alts]))
+        blocks.append(_b("buttons", title="Questions I can answer, for example:",
+                         items=[(q, q) for q in _examples(4)]))
+        return blocks, None
+    if len(articles) < len(concepts[:2]) and wiki_down:
+        missing = [c.get("label") for c in concepts[:2] if c.get("label") not in [a[0] for a in articles]]
+        notes = [_b("caption", v=f"Wikipedia didn't respond for {_md_safe(', '.join(missing))} — ask "
+                                 "again in a minute to include it.")]
+    else:
+        notes = []
+    raw, form = p.get("raw") or "", p.get("form") or ""
+    terms = list(p.get("concept_terms") or [])
+    classes = [m["phrase"] for m in p.get("class_mentions") or []]
+    blocks: List[Dict[str, Any]] = list(notes)
+    # 'agonists vs antagonists' — two concepts and nothing else asked: both
+    # definitions, one after the other
+    if len(articles) > 1 and not [t for t in terms if t not in ("difference", "compare", "versus")]:
+        blocks.append(_b("md", v="#### 📘 " + " vs ".join(_md_safe(a[0]) for a in articles)))
+        for label, secs, _c in articles:
+            src, url = _wsrc(secs)
+            blocks += _answer_box([(s, src, url) for s in _definition(secs, 2)], label=label)
+        blocks.append(_b("caption", v="Definitions from each Wikipedia article (CC BY-SA)."))
+        return blocks, ctx_out
+    label, secs, c = articles[0]
+    src, url = _wsrc(secs)
+    blocks.append(_b("md", v=f"#### 📘 {_md_safe(label)}"))
+    defn = _definition(secs, 2)
+    why = form == "why"
+    need = None
+    if why:
+        need = _terms_re([p.get("relation_target") or ""] + list(p.get("relation_terms") or [])
+                         + list(c.get("terms") or []))
+    heads = _ask_heads(raw, p.get("intents") or [])
+    ranked = []
+    if terms or heads is not None or why or classes:
+        words = _content_terms(terms) + classes
+        ranked = rank_article(_article_sents(secs), terms=words, heads=heads, why=why,
+                              need_re=need, subj_re=_terms_re(classes) if classes else None,
+                              names=bool(_NAMES_Q_RE.search(raw)))
+        # a definition sentence is not an answer to 'which drugs cause it'
+        ranked = [r for r in ranked if r[0] >= (1.2 if words else 1.0)]
+    digests = _list_digests(secs, ranked[:5], raw, src, url) if ranked and not why else []
+    if digests:
+        # 'main CYP3A4 inhibitors' → 'Strong inhibitors: clarithromycin, …'
+        blocks += _answer_box(digests[:1], label="What the article lists")
+        blocks += _pts(digests[1:], title="Also listed", cap=1)
+        if defn:
+            blocks += _pts([(defn[0], src, url)], title=f"What {label} is", cap=1)
+    elif ranked:
+        box = "Why — what the article says" if why else "What the article says"
+        blocks += _answer_box([(s, src, url) for _sc, s, _p in ranked[:2]], label=box)
+        shown = {s for _sc, s, _p in ranked[:2]}
+        if defn and defn[0] not in shown:
+            blocks += _pts([(defn[0], src, url)], title=f"What {label} is", cap=1)
+        blocks += _pts([(s, src, url) for _sc, s, _p in ranked[2:6]], title="More from the article",
+                       cap=2, more="More")
+    else:
+        if terms and not why:
+            blocks.append(_b("caption", v=f"The article doesn't single out “{_md_safe(' '.join(terms))}” "
+                                          f"— here is what {_md_safe(label)} is:"))
+        blocks += _answer_box([(s, src, url) for s in defn], label="What it is")
+        # one opening line from each of the main sections, as a map of the topic
+        keys, seen_heads = [], set()
+        for sec in secs.get("sections") or []:
+            head = sec.get("heading", "")
+            if head in seen_heads or not re.search(r"mechanism|cause|pathophysiolog|sign|symptom|"
+                                                    r"treatment|management|example|type|use", head, re.I):
+                continue
+            first = next((s for s in _split_sentences(re.sub(r"\s+", " ", sec.get("text") or ""))
+                          if len(s) > 40), "")
+            if first:
+                seen_heads.add(head)
+                keys.append((f"**{head}** — {first}", src, url))
+        blocks += _pts(keys, title="Key points", cap=3, more="More sections")
+    blocks.append(_b("caption", v=f"From Wikipedia's article [“{secs.get('title', '')}”]({url}) (CC BY-SA) — "
+                                  "an encyclopedia summary, not clinical guidance. Ask about a specific "
+                                  "medicine to see its FDA label."))
+    nxt = []
+    if c.get("priority") == "high" or c.get("with_drug") == "side_effects":
+        nxt = [("💊 Which drugs cause it?", f"Which drugs cause {label}?"),
+               ("🩺 How is it treated?", f"How is {label} treated?"),
+               ("🔎 Signs & symptoms", f"What are the signs of {label}?")]
+    elif not concepts:
+        nxt = [("🔎 Causes", f"What causes {label}?"), ("🩺 Treatment", f"How is {label} treated?")]
+    if nxt:
+        blocks.append(_b("buttons", title="Ask next", items=nxt))
+    if not concepts:                     # a searched concept: remember the article found
+        ctx_out["concepts"] = [{"id": "search", "label": label, "wiki": secs.get("title", label),
+                                "terms": []}]
+    return blocks, ctx_out
+
+
+def _concept_drug_hits(ctx: Dict[str, Any], c: Dict[str, Any]) -> List[Tuple[str, str, str]]:
+    """The drug's own sentences that mention a concept ('narrow therapeutic
+    index'), FDA label first, most concept words first."""
+    terms = list(c.get("terms") or []) or [c.get("label") or ""]
+    hits = _mentions(ctx, terms, k=12)
+    rx = _terms_re(terms)
+    if rx is not None:
+        hits.sort(key=lambda h: (-len({m.group(0).lower() for m in rx.finditer(h[0])}),
+                                 h[1] != "FDA label"))
+    return hits
+
+
+def _ans_concept(ctx, name, p):
+    """'therapeutic index of digoxin', 'zero-order kinetics of phenytoin': what
+    the drug's sources say about the concept, what the concept is, and what
+    the concept's article says about this drug."""
+    blocks: List[Dict[str, Any]] = []
+    for c in (p.get("concepts") or [])[:1]:
+        label = c.get("label") or c.get("wiki")
+        hits = _concept_drug_hits(ctx, c)
+        if hits:
+            blocks += _answer_box(hits[:2], label=f"{name} — {label}")
+            blocks += _pts(hits[2:6], title="More from the sources", cap=2, more="More")
+        else:
+            blocks.append(_b("info", v=f"{_md_safe(name)}'s FDA label, PubChem, ChEMBL and Wikipedia "
+                                       f"text don't mention {_md_safe(label.lower())} — that isn't "
+                                       "evidence either way."))
+        secs = cached_wiki_sections(c["wiki"]) or {}
+        if secs:
+            src, url = _wsrc(secs)
+            defn = _definition(secs, 1)
+            if defn:
+                blocks += _pts([(defn[0], src, url)], title=f"What {label.lower()} means", cap=1)
+            subj = _drug_names_re(ctx) or re.compile(r"\b" + re.escape(name) + r"\b", re.I)
+            about = [(s, src, url) for s, _p in _article_sents(secs) if subj.search(s)]
+            blocks += _pts(_dedup_against(about, [h[0] for h in hits[:6]]),
+                           title=f"The “{secs.get('title')}” article on {name}", cap=2, more="More")
+    return blocks
+
+
+_INTENT_BUILDERS["concept"] = _ans_concept
+
+
+def _answer_class_topic(p, opts) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """A question about a drug CLASS ('how do SSRIs work', 'why do ACE
+    inhibitors cause a dry cough', 'which beta blockers are cardioselective')
+    → the class's article, ranked for the question; the members to ask about."""
+    ments = p.get("class_mentions") or []
+    first = ments[0]
+    phrase = first["phrase"]
+    nice = phrase[:1].upper() + phrase[1:]
+    _progress(opts, f"Reading about {phrase}…")
+    secs = cached_wiki_sections(first["wiki"]) or {}
+    if not secs:
+        note = ([_b("warning", v=f"Wikipedia didn't respond just now, so I can't explain this from the "
+                                 f"{_md_safe(first['wiki'])} article — ask again in a minute. Meanwhile, "
+                                 "the drugs in the class:")]
+                if cs.host_failing(cs.WIKI_API) else [])
+        return note + _answer_class_list(p), {"class_mentions": ments, "intents": p.get("intents") or []}
+    src, url = _wsrc(secs)
+    members = _class_members(first.get("slugs") or [])
+    names = [secs.get("title", ""), phrase] + members
+    subj_re = _terms_re(names)
+    why = p.get("form") == "why"
+    intents = [i for i in p.get("intents") or [] if i not in ("overview", "search")]
+    need = None
+    if why:
+        need = _terms_re([p.get("relation_target") or ""] + list(p.get("relation_terms") or []))
+    heads = _ask_heads(p.get("raw") or "", intents)
+    sents = _article_sents(secs)
+    # other classes named ('…with ACE inhibitors and diuretics'): their articles'
+    # sentences that name this class count too
+    extra_src: Dict[str, Tuple[str, str]] = {}
+    for m in ments[1:3]:
+        o = cached_wiki_sections(m["wiki"]) or {}
+        for s, path in _article_sents(o):
+            if subj_re is not None and subj_re.search(s):
+                sents.append((s, path))
+                extra_src[s] = _wsrc(o)
+    terms = [f for f in p.get("focus") or [] if f not in ("drugx",)]
+    ranked = rank_article(sents, terms=terms, heads=heads, why=why, subj_re=subj_re, need_re=need,
+                          names=bool(_NAMES_Q_RE.search(p.get("raw") or "")))
+    ranked = [r for r in ranked if r[0] >= 1.0]
+    q = (p.get("raw") or "").strip().rstrip("?")
+    blocks: List[Dict[str, Any]] = [_b("md", v=f"#### 🗂 {_md_safe(q[:1].upper() + q[1:])}?")]
+    if ranked:
+        box = ("Why — what the sources say" if why else
+               {"mechanism": "How they work"}.get(intents[0] if intents else "", "What the sources say"))
+        blocks += _answer_box([(s,) + extra_src.get(s, (src, url)) for _sc, s, _p in ranked[:2]], label=box)
+        blocks += _pts([(s,) + extra_src.get(s, (src, url)) for _sc, s, _p in ranked[2:6]],
+                       title="More from the sources", cap=2, more="More")
+    else:
+        blocks.append(_b("info", v=f"The {secs.get('title')} article doesn't address that directly — "
+                                   f"here is what {_md_safe(phrase)} are:"))
+        blocks += _answer_box([(s, src, url) for s in _definition(secs, 2)], label="What they are")
+    if members:
+        blocks.append(_b("md", v=f"**{_md_safe(nice)} include:** {_md_safe(', '.join(members[:12]))}"
+                                 + (" …" if len(members) > 12 else "")))
+        # the same question about one member, answered from its own FDA label
+        rx = cr._phrase_rx(phrase) if cr else None
+        items = []
+        for mname in members[:3]:
+            ask = rx.sub(mname.lower(), (p.get("raw") or "").lower(), count=1) if rx else ""
+            if ask and ask != (p.get("raw") or "").lower():
+                items.append((f"Ask about {mname}", ask))
+        if items:
+            blocks.append(_b("buttons", title="Same question for one drug (its own label):", items=items))
+    blocks.append(_b("caption", v=f"From Wikipedia's [“{secs.get('title')}”]({url}) article (CC BY-SA) — "
+                                  "statements about the class as a whole; individual drugs differ."))
+    return blocks, {"class_mentions": ments, "intents": p.get("intents") or []}
 
 
 def _answer_interaction(p, opts, blocks) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
@@ -8715,13 +9431,15 @@ def _answer_interaction(p, opts, blocks) -> Tuple[List[Dict[str, Any]], Optional
         blocks.append(_b("caption", v=f"(couldn't identify {_md_safe(nb)} — searching "
                                       f"{_md_safe(na)}'s sources for the name as typed)"))
     blocks.append(_b("md", v=f"#### 🔀 {_md_safe(na)} + {_md_safe(nb)}"))
-    blocks += _ans_interactions(ca, na, p, other=(nb, cb))
+    rev = []
     if cb:
-        hits = _mentions(cb, _interaction_terms(ca, na),
-                         topics={"interactions", "warnings", "side_effects", "pk", "pharma"})
-        if hits:
-            blocks += _pts(hits, title=f"…and what {nb}'s sources say about {na}", cap=3,
-                           more="More mentions")
+        rev = _mentions(cb, _interaction_terms(ca, na),
+                        topics={"interactions", "warnings", "side_effects", "pk", "pharma"})
+    blocks += _pair_verdict(ca, na, nb, _interaction_terms(cb, nb) if cb else [nb], rev)
+    blocks += _ans_interactions(ca, na, p, other=(nb, cb))
+    if rev:
+        blocks += _pts(rev, title=f"…and what {nb}'s sources say about {na}", cap=3,
+                       more="More mentions")
     blocks.append(_b("caption", v="Interaction text is quoted from each drug's own FDA label / "
                                   "PubChem / Wikipedia — no mention isn't proof of safety. "
                                   "Ask a pharmacist before combining medicines."))
@@ -8741,6 +9459,18 @@ def _answer_class_list(p) -> List[Dict[str, Any]]:
     slugs = p.get("class_slugs") or []
     phrase = p.get("class_phrase") or (dl.class_name(slugs[0]) if slugs else "")
     blocks = [_b("md", v=f"#### 🗂 {_md_safe(phrase[:1].upper() + phrase[1:])}")]
+    # what the class is (its article's opening line) and, for 'the strongest
+    # painkiller'-type questions, what the article says about that
+    ments = p.get("class_mentions") or []
+    secs = (cached_wiki_sections(ments[0]["wiki"]) or {}) if ments else {}
+    if secs:
+        src, url = _wsrc(secs)
+        blocks += _answer_box([(s, src, url) for s in _definition(secs, 1)], label="What they are")
+        focus = [f for f in p.get("focus") or [] if f != "drugx"]
+        if focus:
+            hits = [r for r in rank_article(_article_sents(secs), terms=focus, k=3) if r[0] >= 1.0]
+            blocks += _pts([(s, src, url) for _sc, s, _p in hits], title=f"About “{' '.join(focus)}”",
+                           cap=2, more="More")
     seen: set = set()
     first_drugs = []
     for slug in slugs[:4]:
@@ -8767,15 +9497,57 @@ def _answer_class_list(p) -> List[Dict[str, Any]]:
     return blocks
 
 
+# Condition (chat_router.CONDITIONS label) → its Wikipedia article, for
+# 'first-line / best / recommended' questions the ATC list can't answer.
+_CONDITION_WIKI = {
+    "high blood pressure": "Hypertension", "high cholesterol": "Hyperlipidemia",
+    "diabetes": "Type 2 diabetes", "asthma & COPD": "Asthma",
+    "heartburn, reflux & ulcers": "Gastroesophageal reflux disease",
+    "depression": "Major depressive disorder", "anxiety": "Generalized anxiety disorder",
+    "insomnia": "Insomnia", "epilepsy & seizures": "Epilepsy", "migraine": "Migraine",
+    "gout": "Gout", "osteoporosis": "Osteoporosis", "underactive thyroid": "Hypothyroidism",
+    "allergies & hay fever": "Allergic rhinitis", "constipation": "Constipation",
+    "diarrhoea": "Diarrhea", "acne": "Acne", "eczema, dermatitis & psoriasis": "Atopic dermatitis",
+    "Parkinson's disease": "Parkinson's disease", "dementia": "Alzheimer's disease",
+    "ADHD": "Attention deficit hyperactivity disorder", "angina": "Angina",
+    "blood clots": "Deep vein thrombosis", "erectile dysfunction": "Erectile dysfunction",
+    "glaucoma": "Glaucoma", "overactive bladder": "Overactive bladder",
+    "enlarged prostate": "Benign prostatic hyperplasia", "malaria": "Malaria",
+    "psychosis, schizophrenia & bipolar": "Schizophrenia", "weight loss": "Obesity",
+    "quitting smoking": "Smoking cessation", "colds, flu & blocked nose": "Common cold",
+}
+_FIRST_LINE_Q_RE = re.compile(r"first[- ]line|best|recommended|preferred|drug of choice|go-to|"
+                              r"usually (?:given|prescribed|used)|standard treatment|initial treatment",
+                              re.I)
+_FIRST_LINE_RE = re.compile(r"first[- ]line|first choice|initial(?:ly)? (?:treat|therap|management)|"
+                            r"recommended|preferred|drug of choice|mainstay", re.I)
+
+
 def _answer_condition(p, opts) -> List[Dict[str, Any]]:
     if not HAS_DRUG_LIBRARY:
         return [_b("info", v="The Drug Library isn't available for condition lookups.")]
     cond = p["condition"]
     sg = opts["region"] == "SG" and HAS_SG_REGISTER
-    blocks = [_b("md", v=f"#### 💡 Medicines used for {cond['label']}"),
-              _b("caption", v="Grouped by WHO ATC class from the Drug Library — what's used, not "
-                              "a recommendation. A pharmacist or doctor can say what suits you.")]
+    blocks = [_b("md", v=f"#### 💡 Medicines used for {cond['label']}")]
+    title = _CONDITION_WIKI.get(cond["label"])
+    if title and _FIRST_LINE_Q_RE.search(p.get("raw") or ""):
+        # 'first-line treatment for hypertension': what the condition's article
+        # says is used first — the ATC list below can't rank
+        _progress(opts, f"Reading Wikipedia on {title}…")
+        secs = cached_wiki_sections(title) or {}
+        if secs:
+            src, url = _wsrc(secs)
+            hits = [r for r in rank_article(_article_sents(secs), terms=["first", "line", "treatment"],
+                                            heads=_TOPIC_HEAD_RE["uses"], need_re=_FIRST_LINE_RE,
+                                            names=True, k=4) if r[0] >= 1.0]
+            if hits:
+                blocks += _answer_box([(s, src, url) for _sc, s, _p in hits[:2]],
+                                      label="What's used first (encyclopedia summary)")
+                blocks += _pts([(s, src, url) for _sc, s, _p in hits[2:]], title="More", cap=1)
+    blocks.append(_b("caption", v="Grouped by WHO ATC class from the Drug Library — what's used, not "
+                                  "a recommendation. A pharmacist or doctor can say what suits you."))
     buttons = []
+    listed = 0
     for code in cond["codes"]:
         drugs = dl.drugs_in_class(code)
         if not drugs:
@@ -8791,13 +9563,14 @@ def _answer_condition(p, opts) -> List[Dict[str, Any]]:
             rows.append((d["name"], tag))
         if not rows:
             continue
+        listed += 1
         txt = ", ".join(f"{n} ({t})" if t else n for n, t in rows[:15]) + (" …" if len(rows) > 15 else "")
         blocks.append(_b("md", v=f"**{_md_safe(dl.class_name(code))}:** {_md_safe(txt)}"))
         buttons += [(n, f"How does {n} work?") for n, _t in rows[:2]]
-    if sg:
+    if sg and listed:
         blocks.append(_b("caption", v="Only medicines registered with HSA are listed. GSL = general "
                                       "sale · P = pharmacy-only · POM = prescription-only."))
-    if len(blocks) == 2:
+    if not listed:
         blocks.append(_b("info", v="No matching medicines found in the library."))
     blocks.append(_b("buttons", title="Ask about one:", items=buttons[:4]))
     return blocks
@@ -8888,25 +9661,99 @@ def _help_blocks() -> List[Dict[str, Any]]:
                    "- **Chemistry** — *structure of codeine*, *pKa of aspirin*, *3D structure of "
                    "caffeine*\n"
                    "- **Why / how questions** — *why is glucagon the antidote for beta-blocker "
-                   "overdose?*, *how does naloxone reverse morphine?* (finds where the sources "
-                   "explain the link)\n"
-                   "- **Compare** — *metoprolol vs propranolol*\n"
-                   "- **Brands & classes** — *brands of atorvastatin in Singapore*, *what are "
-                   "statins?*, *what can I take for heartburn?*\n"
+                   "overdose?*, *why does warfarin have so many interactions?*, *why is amlodipine "
+                   "making my ankles swell?* (finds where the sources explain it)\n"
+                   "- **Drug classes** — *how do SSRIs work?*, *why do ACE inhibitors cause a dry "
+                   "cough?*, *which beta blockers are cardioselective?*, *list some statins*\n"
+                   "- **Pharmacology & conditions** — *what is first-pass metabolism?*, *therapeutic "
+                   "index of digoxin*, *drugs to avoid in G6PD deficiency*, *agonist vs antagonist*\n"
+                   "- **Two medicines** — *can I take ibuprofen if I'm on warfarin?*, *metoprolol vs "
+                   "propranolol*\n"
+                   "- **Brands & availability** — *brands of atorvastatin in Singapore*, *what can I "
+                   "take for heartburn?*\n"
+                   "- **Several questions at once** — *what is serotonin syndrome and which drugs "
+                   "cause it?*\n"
                    "- **Follow-ups** — *what about its half-life?*, *and morphine?*"),
         _b("buttons", title="Try:", items=[(q, q) for q in _examples(6)]),
     ]
 
 
 def chat_respond(text: str, opts: Dict[str, Any]) -> Dict[str, Any]:
-    """Answer one chat message → an assistant message ({"role", "blocks"})."""
+    """Answer one chat message → an assistant message ({"role", "blocks"}). A
+    message holding several questions ('what is X and why does it…') is
+    answered part by part, each part's subject carrying into the next."""
     t0, req0 = time.perf_counter(), cs.REQUEST_COUNT
+    parts = cr.split_question(text) if cr else [text]
+    if len(parts) == 1:
+        blocks, mode = _respond_one(text, opts)
+    else:
+        blocks, mode = [], ""
+        for i, part in enumerate(parts):
+            pb, mode = _respond_one(part, opts)
+            if mode == "clarify":
+                # 'what are the side effects and what's the dose of metformin':
+                # the medicine named later is the subject of the earlier part too
+                later = next((q["entities"][0] for q in (cr.parse_query(x) for x in parts[i + 1:])
+                              if q.get("entities")), None)
+                if later:
+                    st.session_state["chat_context"] = {"entity": later, "intents": []}
+                    pb, mode = _respond_one(part, opts)
+            if i < len(parts) - 1:            # follow-up buttons only after the last part
+                pb = [b for b in pb if b.get("t") != "buttons"]
+            blocks.append(_b("md", v=f"##### {i + 1}. {_md_safe(part[:1].upper() + part[1:])}"))
+            blocks += pb
+            # 'what's the antidote for paracetamol overdose and how does IT work':
+            # 'it' is the antidote this part's answer named, not paracetamol
+            if i + 1 < len(parts) and _ANTIDOTE_Q_RE.search(part) and \
+                    cr._PRONOUN_RE.search(parts[i + 1].lower()):
+                ante = _antidote_named(pb, part)
+                if ante:
+                    st.session_state["chat_context"] = {"entity": ante, "intents": []}
+                    blocks.append(_b("caption", v=f"(next, “it” = **{_md_safe(ante['display'])}**, "
+                                                  "the antidote named above)"))
+    n_req = cs.REQUEST_COUNT - req0
+    if mode not in ("empty", "help", "thanks"):
+        blocks.append(_b("caption", v=f"⏱ {time.perf_counter() - t0:.1f} s · "
+                                      + (f"{n_req} live request{'s' if n_req != 1 else ''}"
+                                         if n_req else "from cache")))
+    return {"role": "assistant", "blocks": blocks}
+
+
+_ANTIDOTE_Q_RE = re.compile(r"\bantidotes?\b|\breversal agents?\b|\bwhat (?:is|are) (?:given|used) "
+                            r"(?:for|to treat|to reverse)\b", re.I)
+
+
+def _antidote_named(blocks: List[Dict[str, Any]], question: str) -> Optional[Dict[str, Any]]:
+    """The medicine an antidote answer names ('…N-acetylcysteine should be
+    given…'), as a chat entity — from sentences about the antidote/treatment,
+    never the drug the question was about."""
+    if cr is None:
+        return None
+    asked = {(e.get("query") or "").lower() for e in cr.parse_query(question).get("entities") or []}
+    lex = cr._lexicon()[0]
+    texts = [str(it[0]) for b in blocks if b.get("t") in ("answer", "points") for it in b.get("items") or []]
+    # a sentence that SAYS 'antidote' first ('the antidote acetylcysteine…'),
+    # then treatment wording — not a mechanism line naming glutathione
+    for cue in (r"antidot", r"administ|given|treat|revers"):
+        for t in texts:
+            if not re.search(cue, t, re.I):
+                continue
+            for w in re.findall(r"[a-z][a-z\-]{4,}", t.lower()):
+                e = lex.get(w.replace("n-", "", 1) if w.startswith("n-") else w)
+                if e and e.get("kind") in ("library", "alias") and \
+                        (e.get("query") or "").lower() not in asked and not cr._is_common(w):
+                    return {"kind": e["kind"], "query": e["query"], "display": e.get("display") or w}
+    return None
+
+
+def _respond_one(text: str, opts: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
+    """Answer one question; updates the chat context → (blocks, mode)."""
     mode = ""
     context = st.session_state.get("chat_context") or {}
     try:
         p = cr.parse_query(text, context=context)
     except Exception as e:  # noqa: BLE001
-        return {"role": "assistant", "blocks": _error_blocks(e, opts)}
+        return _error_blocks(e, opts), "error"
     try:
         mode = p["mode"]
         new_ctx = None
@@ -8924,6 +9771,12 @@ def chat_respond(text: str, opts: Dict[str, Any]) -> Dict[str, Any]:
             blocks = _pet_blocks(p)
         elif mode == "class_list":
             blocks = _answer_class_list(p)
+            if p.get("class_mentions"):
+                new_ctx = {"class_mentions": p["class_mentions"], "intents": p.get("intents") or []}
+        elif mode == "class_topic":
+            blocks, new_ctx = _answer_class_topic(p, opts)
+        elif mode == "concept":
+            blocks, new_ctx = _answer_concept(p, opts)
         elif mode == "condition":
             blocks = _answer_condition(p, opts)
         elif mode == "clarify":
@@ -8949,12 +9802,7 @@ def chat_respond(text: str, opts: Dict[str, Any]) -> Dict[str, Any]:
             st.session_state["chat_context"] = new_ctx
     except Exception as e:  # noqa: BLE001
         blocks = _error_blocks(e, opts)
-    n_req = cs.REQUEST_COUNT - req0
-    if mode not in ("empty", "help", "thanks"):
-        blocks.append(_b("caption", v=f"⏱ {time.perf_counter() - t0:.1f} s · "
-                                      + (f"{n_req} live request{'s' if n_req != 1 else ''}"
-                                         if n_req else "from cache")))
-    return {"role": "assistant", "blocks": blocks}
+    return blocks, mode
 
 
 def _error_blocks(e: Exception, opts: Dict[str, Any]) -> List[Dict[str, Any]]:

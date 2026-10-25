@@ -106,8 +106,10 @@ RESOLVE_CASES = [
     # PubChem knows these brands as synonyms → straight to the ingredient
     ("Lipitor", "US", {60822, 60823}, None),        # atorvastatin calcium / free acid
     ("Panadol", "SG", {1983}, None),                 # paracetamol
-    # brands PubChem doesn't list → register lookup (RxNorm / HSA)
-    ("Pepto-Bismol", "US", None, r"^bismuth subsalicylate$"),
+    # brands PubChem doesn't list → register lookup (RxNorm / HSA). (Was
+    # Pepto-Bismol until PubChem added a 'Pepto-bismol' record, CID 16682734,
+    # by 2026-10-25 — it now resolves directly, so it no longer tests this path.)
+    ("Caduet", "US", None, r"^amlodipine \+ atorvastatin$"),
     ("Dhamotil", "SG", None, r"atropine.*\+.*diphenoxylate"),
 ]
 

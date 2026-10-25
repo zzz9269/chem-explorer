@@ -18,6 +18,7 @@ Provides:
 
 from __future__ import annotations
 
+import os
 import re
 import threading
 import time
@@ -38,7 +39,13 @@ except Exception:  # pragma: no cover
 # Configuration
 # ---------------------------------------------------------------------------
 PUG_TIMEOUT = 12
-USER_AGENT = "ChemicalExplorer/1.0 (educational; PubChem+RDKit)"
+# Wikimedia's User-Agent policy asks for a way to contact the operator; clients
+# without one are throttled harder. Set CHEM_EXPLORER_CONTACT (an e-mail or the
+# app's repo URL — on Streamlit Cloud, a top-level entry in the app's Secrets)
+# to include it.
+_CONTACT = os.environ.get("CHEM_EXPLORER_CONTACT", "").strip()
+USER_AGENT = ("ChemicalExplorer/1.0 (educational; PubChem+RDKit"
+              + (f"; {_CONTACT}" if _CONTACT else "") + ")")
 
 PUBCHEM_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
 PUGVIEW_BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug_view"
@@ -105,7 +112,13 @@ def get_session() -> requests.Session:
             # for ~50 s; connect errors and 5xx keep their retries
             read=1,
             backoff_factor=0.6,            # 0.6s, 1.2s, 2.4s ...
-            status_forcelist=(429, 500, 502, 503, 504),
+            # not 429: a rate-limited host said "wait N s" — retrying sooner is
+            # futile and adds load; the breaker pauses the host instead. And
+            # never sleep on a Retry-After inside a request (urllib3 otherwise
+            # retries 429/503 whenever one is sent — a Wikipedia 429 held one
+            # chat answer for 35 s)
+            status_forcelist=(500, 502, 503, 504),
+            respect_retry_after_header=False,
             allowed_methods=frozenset(["GET"]),
             raise_on_status=False,
         )
@@ -133,11 +146,15 @@ def _host_of(url: str) -> str:
 
 
 def host_degraded(host_or_url: str) -> bool:
-    """True while a host's breaker is open (recent consecutive failures)."""
+    """True while a host's breaker is open (recent consecutive failures, or a
+    rate limit's Retry-After still running)."""
     host = _host_of(host_or_url) or (host_or_url or "").lower()
     st = _host_state.get(host)
-    return bool(st and st["fails"] >= _BREAKER_FAILS
-                and time.time() - st["last"] < _BREAKER_COOLDOWN)
+    if not st:
+        return False
+    if st.get("until") and time.time() < st["until"]:
+        return True
+    return bool(st["fails"] >= _BREAKER_FAILS and time.time() - st["last"] < _BREAKER_COOLDOWN)
 
 
 def host_failing(host_or_url: str) -> bool:
@@ -145,16 +162,31 @@ def host_failing(host_or_url: str) -> bool:
     callers use it to avoid caching an empty result caused by an outage."""
     host = _host_of(host_or_url) or (host_or_url or "").lower()
     st = _host_state.get(host)
-    return bool(st and time.time() - st["last"] < _BREAKER_COOLDOWN)
+    return bool(st and (time.time() - st["last"] < _BREAKER_COOLDOWN
+                        or time.time() < st.get("until", 0)))
 
 
-def _record(host: str, ok: bool):
+def _record(host: str, ok: bool, retry_after: Optional[float] = None):
+    """A request's outcome. A 429's Retry-After pauses the host for exactly that
+    long (5 s–5 min) — sooner would be refused, later wastes good answers."""
     if ok:
         _host_state.pop(host, None)
     else:
         st = _host_state.setdefault(host, {"fails": 0, "last": 0.0})
         st["fails"] += 1
         st["last"] = time.time()
+        if retry_after is not None:
+            st["until"] = time.time() + min(max(retry_after, 5.0), 300.0)
+
+
+def _retry_after(r: requests.Response) -> Optional[float]:
+    """Seconds from a 429's Retry-After header (None when absent/unparseable)."""
+    if r is None or r.status_code != 429:
+        return None
+    try:
+        return float(r.headers.get("retry-after") or 30)
+    except (TypeError, ValueError):
+        return 30.0
 
 
 # Live (uncached) HTTP requests made through this module — the app shows the
@@ -173,7 +205,9 @@ def _count():
 # 429s — then blocks the client for many minutes, which empties every lookup.
 # The app's parallel prefetch can exceed 5/s on its own, so requests to such a
 # host are spaced at least this many seconds apart (across all threads).
-_MIN_INTERVAL = {"pubchem.ncbi.nlm.nih.gov": 0.22}
+_MIN_INTERVAL = {"pubchem.ncbi.nlm.nih.gov": 0.22,
+                 # Wikimedia throttles bursts from one client (429s, long Retry-After)
+                 "en.wikipedia.org": 0.12}
 _pace_lock = threading.Lock()
 _next_slot: Dict[str, float] = {}
 
@@ -206,9 +240,10 @@ def _get(url: str, timeout: int = PUG_TIMEOUT) -> Optional[requests.Response]:
         _record(host, False)
         _host_state[host]["fails"] = max(_host_state[host]["fails"], _BREAKER_FAILS)
         return None
-    # 429 = rate-limited: treat like an outage so the breaker sheds load for a
-    # bit (callers fall back fast) instead of every call retrying for seconds
-    _record(host, r.status_code < 500 and r.status_code != 429)
+    # 429 = rate-limited: treat like an outage so the breaker sheds load for as
+    # long as the host asked (callers fall back fast) instead of every call
+    # retrying for seconds
+    _record(host, r.status_code < 500 and r.status_code != 429, _retry_after(r))
     return r
 
 
@@ -545,6 +580,25 @@ _WIKI_SKIP_HEADINGS = {
 _WIKI_HEADING_RE = re.compile(r'^(={2,6})\s*(.+?)\s*\1$')
 
 
+def _wiki_api_get(params: Dict[str, str]) -> Optional[requests.Response]:
+    """GET the MediaWiki action API, paced and reported to the circuit breaker:
+    a throttled (429) or failed request marks the host as failing, so the
+    app doesn't cache its empty result as 'no such article' (a burst of
+    questions once made 'Serotonin syndrome' look missing for the session)."""
+    host = _host_of(WIKI_API)
+    if host_degraded(host):
+        return None
+    _pace(host)
+    _count()
+    try:
+        r = get_session().get(WIKI_API, params=params, timeout=PUG_TIMEOUT)
+    except requests.RequestException:
+        _record(host, False)
+        return None
+    _record(host, r.status_code < 500 and r.status_code != 429, _retry_after(r))
+    return r
+
+
 def wikipedia_sections(title: str) -> Dict[str, Any]:
     """
     Fetch a full Wikipedia article as clean plain text and split it into its
@@ -576,11 +630,7 @@ def wikipedia_sections(title: str) -> Dict[str, Any]:
         "titles": title.strip(),
         "formatversion": "2",
     }
-    _count()
-    try:
-        r = get_session().get(WIKI_API, params=params, timeout=PUG_TIMEOUT)
-    except requests.RequestException:
-        return {}
+    r = _wiki_api_get(params)
     if r is None or r.status_code != 200:
         return {}
     try:
@@ -641,6 +691,33 @@ def wikipedia_sections(title: str) -> Dict[str, Any]:
         "lead": _clean(lead_lines),
         "sections": out_sections,
     }
+
+
+def wikipedia_search(query: str, limit: int = 5) -> List[Dict[str, str]]:
+    """
+    Full-text search of English Wikipedia (MediaWiki ``list=search``) →
+    ``[{"title", "snippet"}]``, best match first; [] on no match or failure.
+    Used to find the article for a concept a question names ('Hashimoto's
+    thyroiditis') when no curated title is known — the caller must still check
+    the hit is about the query (search always returns *something*).
+    """
+    if not query or not query.strip():
+        return []
+    params = {
+        "action": "query", "format": "json", "formatversion": "2",
+        "list": "search", "srsearch": query.strip(), "srlimit": str(max(1, min(limit, 10))),
+        "srprop": "snippet", "srenablerewrites": "1",
+    }
+    r = _wiki_api_get(params)
+    if r is None or r.status_code != 200:
+        return []
+    try:
+        hits = (r.json().get("query", {}) or {}).get("search", []) or []
+    except Exception:
+        return []
+    return [{"title": h.get("title", ""),
+             "snippet": re.sub(r"<[^>]+>", "", h.get("snippet", ""))}
+            for h in hits if h.get("title")]
 
 
 def wikipedia_title_by_inchikey(inchikey: str) -> str:
