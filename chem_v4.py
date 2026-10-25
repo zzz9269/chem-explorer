@@ -85,6 +85,15 @@ except Exception:
     cr = None
     HAS_CHAT = False
 
+# A code update on Streamlit Cloud re-runs this script but keeps helper modules
+# already imported by the running server — a new chem_v4 then meets an OLD
+# chem_sources ("has no attribute 'wikipedia_search'"). Reload stale ones.
+import importlib as _importlib
+if not hasattr(cs, "wikipedia_search"):
+    cs = _importlib.reload(cs)
+if cr is not None and not hasattr(cr, "find_concepts"):
+    cr = _importlib.reload(cr)
+
 # Local log of user-reported data problems (no Streamlit, no network).
 import data_reports as drp
 
