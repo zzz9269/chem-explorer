@@ -297,6 +297,9 @@ def remember_answer(key: Any, value: Any):
 
 
 # ---------------------------------------------------------------- the exchange
+SGD_PER_USD = 1.28     # approximate, checked 2026-10-30; a fixed rate, updated by hand
+
+
 def make_client(api_key: str):
     import anthropic
     # gzip only: an older `brotli` package in the environment raises a TypeError while
@@ -317,16 +320,21 @@ def cost_usd(usage: Dict[str, int]) -> float:
     return (usage.get("input_tokens", 0) * 0.10 + usage.get("output_tokens", 0) * 0.50) / 1e6
 
 
+def cost_sgd(usage: Dict[str, int]) -> float:
+    return cost_usd(usage) * SGD_PER_USD
+
+
 def answer(question: str, *, client: Any, tools: Dict[str, Callable[[Dict[str, Any]], List[Dict[str, str]]]],
            region: str = "SG", audience: str = DEFAULT_AUDIENCE, today: str = "",
            history: Sequence[Tuple[str, str]] = (), prefetched: Sequence[Dict[str, str]] = (),
-           effort: str = EFFORT, on_tool: Optional[Callable[[str, Dict[str, Any]], None]] = None
-           ) -> Dict[str, Any]:
+           effort: str = EFFORT, on_tool: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+           usage: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
     """Answer one question → {"status": "ok" | "refusal" | "unverified" | "failed",
     "answer": verified dict, "evidence": {id: snippet}, "usage": tokens, "tools": calls}.
-    `history` is earlier (question, answer text) pairs, oldest first."""
+    `history` is earlier (question, answer text) pairs, oldest first. Pass `usage` to
+    keep the count of tokens already spent if a later call raises."""
     ev = Evidence(question)
-    usage: Dict[str, int] = {}
+    usage = {} if usage is None else usage
     calls: List[Dict[str, Any]] = []
     out = {"status": "failed", "answer": None, "evidence": ev.items, "usage": usage, "tools": calls, "raw": None}
     corrected = False

@@ -102,6 +102,8 @@ try:
 except Exception:
     ai = None
     HAS_AI = False
+if ai is not None and not hasattr(ai, "cost_sgd"):
+    ai = _importlib.reload(ai)
 
 # Local log of user-reported data problems (no Streamlit, no network).
 import data_reports as drp
@@ -10181,6 +10183,7 @@ def _ai_respond(text: str, opts: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         hit = ai.cached_answer(key)
         if hit:
             st.session_state["chat_context"] = hit.get("context") or {}
+            opts["_ai_saved"] = True
             return hit
     today = time.strftime("%Y-%m-%d")
     used = st.session_state.get("ai_questions", 0)
@@ -10200,12 +10203,13 @@ def _ai_respond(text: str, opts: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                          "list_drugs_in_class": f"Listing {inp.get('drug_class', '')}…"
                          }.get(name, "Checking the sources…"))
 
+    opts["_ai_usage"] = {}
     try:
         prefetched = _ai_prefetch(p, opts)
         _progress(opts, "Writing the answer…")
         res = ai.answer(text, client=ai.make_client(_ai_secret("ANTHROPIC_API_KEY")), tools=tools,
                         region=opts["region"], audience=audience, today=today, history=history,
-                        prefetched=prefetched, on_tool=on_tool)
+                        prefetched=prefetched, on_tool=on_tool, usage=opts["_ai_usage"])
     except Exception as e:  # noqa: BLE001 — any API trouble: the rule-based answer still works
         opts["_ai_note"] = "The AI answer isn't available just now, so this is the source text directly."
         if opts.get("debug_mode"):
@@ -10231,6 +10235,19 @@ def _ai_respond(text: str, opts: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return reply
 
 
+def _ai_cost_note(opts: Dict[str, Any]) -> str:
+    """Tokens this question spent and roughly what they cost, including a failed
+    attempt whose answer was replaced by the rule-based one. Blank without a key."""
+    if not _ai_ready():
+        return ""
+    usage = opts.get("_ai_usage") or {}
+    tokens = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+    if not tokens:
+        return " · 0 tokens · S\\$0" + (" (saved answer)" if opts.get("_ai_saved") else "")
+    # Escaped: a bare $ can start a maths formula in Streamlit markdown
+    return f" · {tokens:,} tokens · ≈ S\\${ai.cost_sgd(usage):.4f}"
+
+
 def chat_respond(text: str, opts: Dict[str, Any]) -> Dict[str, Any]:
     """Answer one chat message → an assistant message ({"role", "blocks"}). A
     message holding several questions ('what is X and why does it…') is
@@ -10239,9 +10256,12 @@ def chat_respond(text: str, opts: Dict[str, Any]) -> Dict[str, Any]:
     reply = _ai_respond(text, opts)
     if reply is not None:
         blocks = list(reply["blocks"])
+        took = f"⏱ {time.perf_counter() - t0:.1f} s"
         if reply["kind"] == "answer":
             what = "AI answer, not from a source" if reply["general"] else "AI summary of the linked sources"
-            blocks.append(_b("caption", v=f"⏱ {time.perf_counter() - t0:.1f} s · {what} · not medical advice"))
+            blocks.append(_b("caption", v=f"{took} · {what} · not medical advice{_ai_cost_note(opts)}"))
+        else:
+            blocks.append(_b("caption", v=f"{took}{_ai_cost_note(opts)}"))
         return {"role": "assistant", "blocks": blocks, "ai_text": reply["text"]}
     parts = cr.split_question(text) if cr else [text]
     if len(parts) == 1:
@@ -10277,7 +10297,7 @@ def chat_respond(text: str, opts: Dict[str, Any]) -> Dict[str, Any]:
     if mode not in ("empty", "help", "thanks"):
         blocks.append(_b("caption", v=f"⏱ {time.perf_counter() - t0:.1f} s · "
                                       + (f"{n_req} live request{'s' if n_req != 1 else ''}"
-                                         if n_req else "from cache")))
+                                         if n_req else "from cache") + _ai_cost_note(opts)))
     return {"role": "assistant", "blocks": blocks}
 
 

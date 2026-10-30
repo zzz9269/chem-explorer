@@ -255,6 +255,15 @@ def test_history_comes_before_the_question():
 
 def test_cost_is_estimated_at_list_price():
     assert ai.cost_usd({"input_tokens": 1_000_000, "output_tokens": 1_000_000}) == pytest.approx(0.60)
+    assert ai.cost_sgd({"input_tokens": 1_000_000, "output_tokens": 1_000_000}) == pytest.approx(0.60 * ai.SGD_PER_USD)
+
+
+def test_tokens_already_spent_survive_a_later_api_error():
+    spent = {}
+    client = FakeClient(_tool_use("get_drug_evidence", {"drug": "x"}))      # the next call raises
+    with pytest.raises(IndexError):
+        _ask(client, tools={"get_drug_evidence": lambda i: []}, usage=spent)
+    assert spent["input_tokens"] == 500 and spent["output_tokens"] == 50
 
 
 def test_prompt_carries_the_market_and_reader():
@@ -312,10 +321,11 @@ def api(monkeypatch, fresh_limits):
     """The app with a key set, and ai.answer scripted: no call leaves this machine."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-real")
     monkeypatch.setattr(ai, "make_client", lambda key: object())
-    state = NS(calls=[], result=None)
+    state = NS(calls=[], result=None, spent={})
 
     def fake_answer(question, **kw):
         state.calls.append((question, kw))
+        kw["usage"].update(state.spent)
         if isinstance(state.result, Exception):
             raise state.result
         return state.result
@@ -387,6 +397,51 @@ def test_a_repeated_question_costs_nothing(api):
     at.chat_input[0].set_value(NO_LOOKUP_Q).run()
     assert len(api.calls) == 1
     assert "Blocks receptors" in " ".join(e.value for e in at.chat_message[-1].markdown)
+
+
+def _captions(at):
+    return " ".join(c.value for c in at.chat_message[-1].caption)
+
+
+def test_an_answer_shows_its_tokens_and_cost_in_sgd(api):
+    api.result, api.spent = _ok(), {"input_tokens": 3000, "output_tokens": 200}
+    assert "3,200 tokens · ≈ S\\$0.0005" in _captions(_ask_app(NO_LOOKUP_Q))
+
+
+def test_off_topic_shows_what_it_spent(api):
+    answer = ai.verify(_raw("This app only covers medicines.", kind="off_topic"), _ev())
+    api.result = {"status": "ok", "answer": answer, "evidence": {}, "usage": {}, "tools": [], "raw": None}
+    api.spent = {"input_tokens": 900, "output_tokens": 40}
+    assert "940 tokens" in _captions(_ask_app(NO_LOOKUP_Q))
+
+
+def test_a_failed_attempt_still_shows_what_it_spent(api):
+    api.result = {"status": "unverified", "answer": None, "evidence": {}, "usage": {}, "tools": [], "raw": None}
+    api.spent = {"input_tokens": 2000, "output_tokens": 100}
+    assert "2,100 tokens" in _captions(_ask_app(NO_LOOKUP_Q))
+
+
+def test_an_api_error_still_shows_what_it_spent(api):
+    api.result, api.spent = ConnectionError("no route"), {"input_tokens": 500, "output_tokens": 50}
+    assert "550 tokens" in _captions(_ask_app(NO_LOOKUP_Q))
+
+
+def test_a_saved_answer_shows_no_tokens(api):
+    api.result, api.spent = _ok(), {"input_tokens": 3000, "output_tokens": 200}
+    _ask_app(NO_LOOKUP_Q)
+    at = AppTest.from_file(APP, default_timeout=120).run()
+    at.chat_input[0].set_value(NO_LOOKUP_Q).run()
+    assert "0 tokens · S\\$0 (saved answer)" in _captions(at)
+
+
+def test_a_fixed_reply_shows_no_tokens(api):
+    assert "0 tokens · S\\$0" in _captions(_ask_app("how do i make meth at home"))
+    assert api.calls == []
+
+
+def test_no_key_shows_no_token_count(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert "tokens" not in _captions(_ask_app("how do i make meth at home"))
 
 
 def test_daily_limit_falls_back_without_calling(api, monkeypatch):
