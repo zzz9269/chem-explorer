@@ -1362,6 +1362,104 @@ def openfda_market_info(generic_name: str, max_brands: int = 6) -> Dict[str, Any
     return {"product_types": types, "brands": brands}
 
 
+# A label can name a condition without treating it: clomiphene's says "the
+# incidence of endometriosis increases with age", so a text match isn't an
+# indication until the words around it read like one.
+_NOT_A_USE_RE = re.compile(r"\b(?:not|cannot|never|excluded?|excluding|ruled? out|incidence|prevalence|"
+                           r"contraindicat\w*|unless|risk of|history of|caution)\b", re.I)
+_A_USE_RE = re.compile(r"\b(?:indicat\w*|treat\w*|therap\w*|manag\w*|reliev\w*|relief|prevent\w*|"
+                       r"control\w*|maintenance|adjunct\w*|uses?)\b", re.I)
+_LABEL_REF_RE = re.compile(r"\(\s*\d+(?:\.\d+)*\s*\)")          # '( 1.3 )' section references
+_INGREDIENT_SUFFIX_RE = re.compile(
+    r"\s+(?:hydrochloride|hcl|sodium|potassium|calcium|magnesium|sulfate|sulphate|maleate|mesylate|"
+    r"dimesylate|besylate|tartrate|citrate|acetate|phosphate|succinate|fumarate|bromide|hyclate|"
+    r"lactate|saccharate|aspartate|monohydrate|dihydrate|hemihydrate|anhydrous|oral|orally|tablets?|"
+    r"capsules?|extended|delayed|d/r|injection|solution|suspension)\b.*$", re.I)
+_NOT_AN_INGREDIENT_RE = re.compile(r"(?:c-?(?:i{1,3}|iv|v)|cv)$", re.I)      # DEA schedule marks
+
+
+def label_use_quote(text: str, term: str, width: int = 150) -> str:
+    """The words of an indications section that name `term` as a use ('' when
+    every mention is something else: a warning, an exclusion, a statistic)."""
+    words = re.findall(r"[A-Za-z0-9]+", term or "")
+    if not text or not words:
+        return ""
+    text = re.sub(r"\s+([.,;:])", r"\1", re.sub(r"\s+", " ", _LABEL_REF_RE.sub(" ", text)))
+    text = re.sub(r"^\s*\d*\s*INDICATIONS(?:\s*(?:AND|&)\s*USAGE)?\s*:?\s*", "", text, flags=re.I)
+    for m in re.finditer(r"\b" + r"[\s\-'’]*".join(map(re.escape, words)), text, re.I):
+        start = text.rfind(". ", 0, m.start()) + 2 if ". " in text[:m.start()] else 0
+        stop = text.find(". ", m.end())
+        stop = stop + 1 if stop >= 0 else len(text)
+        if stop - start < 60:           # 'Endometriosis.' is a heading: what follows says why
+            nxt = text.find(". ", stop + 1)
+            stop = nxt + 1 if nxt >= 0 else len(text)
+        lo, hi = max(start, m.start() - width), min(stop, m.end() + width)
+        if _NOT_A_USE_RE.search(text[lo:hi]) or not _A_USE_RE.search(text[max(0, m.start() - 300):hi]):
+            continue
+        quote = text[lo:hi].strip()
+        return ("…" if lo > start else "") + quote + ("…" if hi < stop else "")
+    return ""
+
+
+def _base_ingredients(generic: str) -> Tuple[str, ...]:
+    """'BETAMETHASONE SODIUM PHOSPHATE AND BETAMETHASONE ACETATE' → ('Betamethasone',)."""
+    parts = [p.strip() for p in re.split(r",\s*(?:and\s+)?|\s+and\s+", generic, flags=re.I)]
+    # 'dimethyl fumarate' IS the drug: a bare methyl left over isn't an ingredient
+    return tuple(sorted({(p if re.match(r"(?:di|mono)?(?:methyl|roximel)\s", p, re.I)
+                          else _INGREDIENT_SUFFIX_RE.sub("", p)).capitalize()
+                         for p in parts if p and not _NOT_AN_INGREDIENT_RE.fullmatch(p)}))
+
+
+def openfda_drugs_for_condition(terms: Tuple[str, ...], max_drugs: int = 10) -> Dict[str, Any]:
+    """Medicines whose FDA label gives a condition as a use — the reverse of a
+    label lookup: {"term", "otc", "drugs": [{"name", "quote", "url"}]}, most-
+    labelled first. Each one is checked against its label's own wording. OTC
+    labels only count with a pharmacologic class (homeopathic remedies are OTC)."""
+    scopes = (('openfda.product_type:"HUMAN PRESCRIPTION DRUG"', False),
+              ('openfda.product_type:"HUMAN OTC DRUG"+AND+_exists_:openfda.pharm_class_epc', True))
+
+    def check(term: str, generic: str, names: Tuple[str, ...]) -> Optional[Dict[str, str]]:
+        search = f'indications_and_usage:"{term}"+AND+openfda.generic_name.exact:"{generic}"'
+        r = _get(f"{OPENFDA_LABEL}?search={_urlquote(search, safe=_OPENFDA_SAFE)}&limit=1")
+        if r is None or r.status_code != 200:
+            return None
+        try:
+            res = (r.json().get("results") or [{}])[0]
+        except Exception:
+            return None
+        quote = label_use_quote(" ".join(res.get("indications_and_usage") or []), term)
+        spl = ((res.get("openfda") or {}).get("spl_set_id") or [""])[0]
+        return {"name": " + ".join(names), "quote": quote,
+                "url": f"https://dailymed.nlm.nih.gov/dailymed/drugInfo.cfm?setid={spl}" if spl else ""}
+
+    for term in terms:
+        term = re.sub(r"[^\w\s'\-]", " ", term or "").strip()
+        for scope, otc in scopes:
+            rows = _openfda_count(f'indications_and_usage:"{term}"+AND+{scope}',
+                                  "openfda.generic_name.exact") if term else []
+            groups: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+            for row in rows:
+                names = _base_ingredients(row["term"])
+                if not names or len(names) > 3:      # procedure kits, not medicines for it
+                    continue
+                g = groups.setdefault(names, {"count": 0, "generic": row["term"]})
+                g["count"] += int(row.get("count") or 0)
+            top = sorted(groups.items(), key=lambda kv: -kv[1]["count"])[:max_drugs]
+            if not top:
+                continue
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                checked = list(ex.map(lambda kv: check(term, kv[1]["generic"].replace('"', ""), kv[0]), top))
+            drugs: List[Dict[str, str]] = []
+            for d in checked:
+                # a misspelt generic name ('PREGABLIN') repeats the same label text
+                if d and d["quote"] and not any(d["quote"] == o["quote"] and d["name"][:4] == o["name"][:4]
+                                                for o in drugs):
+                    drugs.append(d)
+            if drugs:
+                return {"term": term, "otc": otc, "drugs": drugs}
+    return {}
+
+
 def rxnorm_rxcui(name: str) -> str:
     """RxNorm concept id for a drug name (exact/normalised match), or ''."""
     if not name or not name.strip():

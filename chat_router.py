@@ -1089,7 +1089,7 @@ CONDITIONS: List[Tuple[str, str, Tuple[str, ...]]] = [
     ("fungal infections", r"\b(?:fungal|thrush|ringworm|athlete'?s foot|yeast infections?)\b",
      ("D01A", "J02A")),
     ("viral infections (herpes, HIV, influenza)", r"\b(?:herpes|cold sores?|shingles|hiv|"
-     r"influenza|covid\w*)\b", ("J05A",)),
+     r"influenza|(?<!long )covid\w*)\b", ("J05A",)),
     ("acne", r"\bacne\b", ("D10A", "D10B")),
     ("eczema, dermatitis & psoriasis", r"\b(?:eczema|dermatitis|psoriasis)\b", ("D07A", "D05A")),
     ("epilepsy & seizures", r"\b(?:epilep\w*|seizures?|convulsions?)\b", ("N03A",)),
@@ -1118,6 +1118,86 @@ CONDITIONS: List[Tuple[str, str, Tuple[str, ...]]] = [
     ("enlarged prostate", r"\b(?:enlarged prostate|bph|prostat\w* hyperplasia)\b", ("G04CA",)),
 ]
 _CONDITION_RES = [(label, re.compile(pat), codes) for label, pat, codes in CONDITIONS]
+
+# Conditions no ATC group stands for are looked up by the wording of FDA labels,
+# which isn't always the word people use ('autism' → labels say 'autistic
+# disorder') or spell out an abbreviation: pattern, label, label wording, Wikipedia.
+CONDITION_TERMS: List[Tuple[str, str, Tuple[str, ...], str]] = [
+    (r"autis\w*|asd|asperger\w*", "autism spectrum disorder", ("autistic", "autism"), "Autism"),
+    (r"tourette\w*(?:'s)?(?: syndrome| disorder)?|tics?", "Tourette's", ("tourette's",), "Tourette syndrome"),
+    (r"ocd|obsessive[ -]compulsive(?: disorder)?", "obsessive-compulsive disorder",
+     ("obsessive compulsive disorder", "obsessive-compulsive"), "Obsessive–compulsive disorder"),
+    (r"ptsd|post[ -]?traumatic stress(?: disorder)?", "PTSD", ("posttraumatic stress disorder",
+     "post-traumatic stress disorder"), "Post-traumatic stress disorder"),
+    (r"lupus|sle", "lupus", ("lupus",), "Systemic lupus erythematosus"),
+    (r"ms|multiple sclerosis", "multiple sclerosis", ("multiple sclerosis",), "Multiple sclerosis"),
+    (r"ibs|irritable bowel(?: syndrome)?", "irritable bowel syndrome", ("irritable bowel",),
+     "Irritable bowel syndrome"),
+    (r"crohn\w*(?:'s)?(?: disease)?", "Crohn's disease", ("crohn's",), "Crohn's disease"),
+    (r"uc|ulcerative colitis", "ulcerative colitis", ("ulcerative colitis",), "Ulcerative colitis"),
+    (r"rls|restless legs?(?: syndrome)?", "restless legs syndrome", ("restless legs",),
+     "Restless legs syndrome"),
+    (r"als|lou gehrig'?s?(?: disease)?|amyotrophic lateral sclerosis", "ALS",
+     ("amyotrophic lateral sclerosis",), "Amyotrophic lateral sclerosis"),
+    (r"pcos|polycystic ovar\w+(?: syndrome)?", "polycystic ovary syndrome", ("polycystic ovar",),
+     "Polycystic ovary syndrome"),
+    (r"pmdd|premenstrual dysphoric disorder", "premenstrual dysphoric disorder",
+     ("premenstrual dysphoric",), "Premenstrual dysphoric disorder"),
+    (r"binge eating(?: disorder)?", "binge eating disorder", ("binge eating",), "Binge eating disorder"),
+    (r"tb|tuberculosis", "tuberculosis", ("tuberculosis",), "Tuberculosis"),
+    (r"chf|heart failure", "heart failure", ("heart failure",), "Heart failure"),
+]
+_CONDITION_TERM_RES = [(re.compile(rf"(?:{pat})$"), label, terms, wiki)
+                       for pat, label, terms, wiki in CONDITION_TERMS]
+
+_MED_WORD = (r"drugs?|medicines?|medications?|meds|pills?|tablets?|treatments?|therap(?:y|ies)|"
+             r"remed(?:y|ies)|cures?|options?|prescriptions?")
+_TREATS_RES = [re.compile(p) for p in (
+    rf"\b(?:{_MED_WORD}|what|anything|something)\b(?:\s+[\w']+){{0,3}}?\s+"
+    r"(?:for|to (?:treat|help(?: with)?|manage)|that (?:treats?|helps?(?: with)?)|used (?:for|in|to treat)|"
+    r"treats?|helps?(?: with)?)\s+(?P<c>.+)",
+    r"\b(?:how (?:to|do you|do i|do they|can i|can you) (?:treat|manage)|treating|managing|"
+    r"(?:treatment|management) of)\s+(?P<c>.+)",
+    r"\bhow (?:is|are) (?P<c>.+?) (?:treated|managed)\b",
+    rf"^(?P<c>[\w' \-]+?)\s+(?:{_MED_WORD})$",
+)]
+_COND_LEAD_RE = re.compile(r"^(?:(?:my|our|a|an|the|his|her|their|someone|people|patients?)\s+)*"
+                           r"(?:(?:son|daughter|child|kid|brother|sister|mum|mom|dad|father|mother|husband|"
+                           r"wife|partner|friend)(?:'s)?\s+)?(?:(?:with|who has|who have|having)\s+)?"
+                           r"(?:(?:mild|moderate|severe)\s+)?")
+_COND_TAIL_RE = re.compile(r"\s+(?:in|during|while|when|if|that|which|because|for|on|at)\s.*$")
+_NOT_CONDITIONS = {"it", "this", "that", "them", "me", "you", "him", "her", "us", "children", "kids",
+                   "adults", "elderly", "seniors", "babies", "infants", "men", "women", "pregnancy", "sale",
+                   "fun", "free", "cheap", "sleep", "energy", "weight", "work", "school", "now", "today",
+                   "dogs", "cats", "pets", "use", "sure", "real", "example", "instance", "more", "both"}
+# What a 'drugs for X' question may also be asking; anything else ('side
+# effects of drugs for X', 'how do drugs for X work') isn't a request for a list.
+_LIST_ASK_INTENTS = {"uses", "search", "overview", "warnings", "population"}
+
+
+def condition_phrase(text: str) -> Tuple[str, List[str]]:
+    """What a 'drugs for X' / 'what treats X' / 'X medication' question names, and
+    any further ones ('autism and adhd'). ('', []) for any other shape."""
+    t = re.sub(r"\s+", " ", (text or "").lower().replace("’", "'")).strip(" ?!.,;:")
+    for rx in _TREATS_RES:
+        m = rx.search(t)
+        if not m:
+            continue
+        parts = re.split(r"\s+(?:and|or)\s+|\s*[,/&]\s*", _COND_TAIL_RE.sub("", m.group("c")))
+        parts = [_COND_LEAD_RE.sub("", x).strip(" '") for x in parts]
+        parts = [x for x in parts if x and x not in _NOT_CONDITIONS and not x.isdigit()
+                 and x not in STOPWORDS and len(x.split()) <= 5]
+        if parts:
+            return parts[0], parts[1:]
+    return "", []
+
+
+def condition_search(phrase: str) -> Dict[str, Any]:
+    """The `condition` of a parse for a condition with no ATC group of its own."""
+    for rx, label, terms, wiki in _CONDITION_TERM_RES:
+        if rx.match(phrase):
+            return {"label": label, "codes": [], "search": list(terms), "wiki": wiki, "asked": phrase}
+    return {"label": phrase, "codes": [], "search": [phrase], "wiki": "", "asked": phrase}
 
 
 @lru_cache(maxsize=1)
@@ -2192,8 +2272,16 @@ def parse_query(raw: str, context: Optional[Dict] = None) -> Dict:
             weak = weak[1:]
         else:
             cond = find_condition(t)
-            if cond and _CONDITION_TRIGGER_RE.search(t) and not leftover_runs and not use_ctx:
+            phrase, also = condition_phrase(raw) if not use_ctx else ("", [])
+            # 'adhd' isn't a common word, so it's left over — but it's what's asked
+            named = bool(phrase) and find_condition(phrase) == cond
+            if cond and _CONDITION_TRIGGER_RE.search(t) and (not leftover_runs or named) and not use_ctx:
                 out.update(mode="condition", condition={"label": cond[0], "codes": cond[1]},
+                           intents=intents, focus=focus)
+                return out
+            # 'drugs for autism': a condition, not a chemical to look up in PubChem
+            if phrase and not (set(intents) - _LIST_ASK_INTENTS):
+                out.update(mode="condition", condition=dict(condition_search(phrase), also=also),
                            intents=intents, focus=focus)
                 return out
             # 3. a follow-up about the concept / class asked about last time

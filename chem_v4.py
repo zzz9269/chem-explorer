@@ -88,11 +88,11 @@ except Exception:
 
 # A code update on Streamlit Cloud re-runs this script but keeps helper modules
 # already imported by the running server — a new chem_v4 then meets an OLD
-# chem_sources ("has no attribute 'wikipedia_search'"). Reload stale ones.
+# chem_sources ("has no attribute 'openfda_drugs_for_condition'"). Reload stale ones.
 import importlib as _importlib
-if not hasattr(cs, "wikipedia_search"):
+if not hasattr(cs, "openfda_drugs_for_condition"):
     cs = _importlib.reload(cs)
-if cr is not None and not hasattr(cr, "find_concepts"):
+if cr is not None and not hasattr(cr, "condition_search"):
     cr = _importlib.reload(cr)
 
 # Short written answers from Claude Haiku; the rule-based answer is the fallback.
