@@ -4,9 +4,17 @@ A Streamlit app for looking up medicines and chemicals: uses, dosing, side
 effects, warnings, pharmacology and full chemistry — with every fact tagged by
 its source. Singapore mode adds HSA-registered brands and POM / P / GSL status.
 
-**No AI model is used.** Answers (including the *Ask* chat mode) are matched
-from the sources below by rule-based code, so nothing is invented — every line
-is quoted from a named source you can click through to.
+**Ask writes short answers with AI, checked against the sources.** Claude Haiku
+reads the question and the sources below, and every number it states has to be
+in the snippet it cites or the answer isn't shown. Anything not from a source is
+marked as such. If the AI isn't available, can't be verified or the daily limit
+is reached, Ask shows the rule-based answer quoted from the sources. Questions
+asked are sent to Anthropic. Explore, the Drug Library and Reference use no AI.
+
+To turn AI on, add `ANTHROPIC_API_KEY` to the Streamlit secrets (never to a file
+in this folder). Optional secrets `AI_DAILY_LIMIT` (default 200 questions for the
+whole app) and `AI_SESSION_LIMIT` (default 40 per visitor) cap the spend. Without
+a key the app runs exactly as before, with no AI.
 
 > For information only — not medical advice.
 
@@ -19,11 +27,11 @@ is quoted from a named source you can click through to.
 | Every sentence links to its source; "not stated" when the sources are silent | Rarely shows where a claim came from |
 | Chemistry computed from the structure (RDKit): formula, stereocentres, drug-likeness, acid/base centres and charge at pH 7.4 | Recalls or approximates |
 | Your own *Mainstream Drug Reference*, side by side with the official sources | — |
-| Free, no account, no API key | — |
+| Free, no account | — |
 
-A chatbot is better at open conversation, at multi-step reasoning about a
-specific patient, and at explaining something in new words. This app is the
-place to **check** what the sources actually say.
+A chatbot is better at open conversation and at multi-step reasoning about a
+specific patient. This app is the place to get a short answer you can **check**
+against what the sources actually say.
 
 ## How Ask understands questions
 

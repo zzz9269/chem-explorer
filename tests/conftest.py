@@ -11,6 +11,9 @@ if ROOT not in sys.path:
 # chem_v4 imports Streamlit; outside `streamlit run` it logs "no runtime"
 # warnings on every cached call — noise, not failures.
 warnings.filterwarnings("ignore")
+# The suite checks the rule-based answers and must not spend API credit, whatever
+# this machine has set. tests/eval_ai_questions.py is the run that uses the API.
+os.environ.pop("ANTHROPIC_API_KEY", None)
 logging.getLogger("streamlit").setLevel(logging.ERROR)
 for name in ("streamlit.runtime.caching.cache_data_api",
              "streamlit.runtime.scriptrunner_utils.script_run_context",

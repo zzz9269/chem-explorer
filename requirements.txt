@@ -12,6 +12,7 @@ pandas>=2.0
 pillow>=10.0            # 2D image handling / PNG export
 bleach>=6.0             # sanitize PubChem HTML fragments
 altair>=5.0             # charts (FAERS, drug-likeness, charge vs pH)
+anthropic>=2.3,<3       # Ask's written answers (only used when ANTHROPIC_API_KEY is set)
 
 # Structure drawing (optional but recommended — returns SMILES directly)
 streamlit-ketcher>=0.0.1
