@@ -1197,6 +1197,8 @@ def openfda_label(generic_name: str = "", brand_name: str = "",
         fetched = dict(zip(flat, ex.map(lambda a: _openfda_fetch(a[0], limit=25), flat)))
         main_route = (main_route.upper() if main_route
                       else f_route.result() if f_route else "ORAL")
+    if not any(fetched.values()):        # under load it also answers 404 for drugs it has: ask once more
+        fetched[flat[-1]] = _openfda_fetch(flat[-1][0], limit=25)
 
     def score(c):
         return _label_score(c, main_route)
@@ -1366,10 +1368,13 @@ def openfda_market_info(generic_name: str, max_brands: int = 6) -> Dict[str, Any
 # incidence of endometriosis increases with age", so a text match isn't an
 # indication until the words around it read like one.
 _NOT_A_USE_RE = re.compile(r"\b(?:not|cannot|never|excluded?|excluding|ruled? out|incidence|prevalence|"
-                           r"contraindicat\w*|unless|risk of|history of|caution)\b", re.I)
+                           r"contraindicat\w*|unless|risk of|risk factors?|history of|caution)\b", re.I)
 _A_USE_RE = re.compile(r"\b(?:indicat\w*|treat\w*|therap\w*|manag\w*|reliev\w*|relief|prevent\w*|"
                        r"control\w*|maintenance|adjunct\w*|uses?)\b", re.I)
 _LABEL_REF_RE = re.compile(r"\(\s*\d+(?:\.\d+)*\s*\)")          # '( 1.3 )' section references
+_SECTION_NUMBER_RE = re.compile(r"\d+\.\d+\s+(?=[A-Z])")        # '1.3 Irritability…'
+_RUN_ON_HEADING_RE = re.compile(r"\s\d+\.\d+\s+[A-Z]")
+_WHOLE_SENTENCE_CHARS = 330
 _INGREDIENT_SUFFIX_RE = re.compile(
     r"\s+(?:hydrochloride|hcl|sodium|potassium|calcium|magnesium|sulfate|sulphate|maleate|mesylate|"
     r"dimesylate|besylate|tartrate|citrate|acetate|phosphate|succinate|fumarate|bromide|hyclate|"
@@ -1386,8 +1391,10 @@ def label_use_quote(text: str, term: str, width: int = 150) -> str:
         return ""
     text = re.sub(r"\s+([.,;:])", r"\1", re.sub(r"\s+", " ", _LABEL_REF_RE.sub(" ", text)))
     text = re.sub(r"^\s*\d*\s*INDICATIONS(?:\s*(?:AND|&)\s*USAGE)?\s*:?\s*", "", text, flags=re.I)
+    fallback = ""
     for m in re.finditer(r"\b" + r"[\s\-'’]*".join(map(re.escape, words)), text, re.I):
         start = text.rfind(". ", 0, m.start()) + 2 if ". " in text[:m.start()] else 0
+        start += len(_SECTION_NUMBER_RE.match(text, start).group()) if _SECTION_NUMBER_RE.match(text, start) else 0
         stop = text.find(". ", m.end())
         stop = stop + 1 if stop >= 0 else len(text)
         if stop - start < 60:           # 'Endometriosis.' is a heading: what follows says why
@@ -1396,9 +1403,15 @@ def label_use_quote(text: str, term: str, width: int = 150) -> str:
         lo, hi = max(start, m.start() - width), min(stop, m.end() + width)
         if _NOT_A_USE_RE.search(text[lo:hi]) or not _A_USE_RE.search(text[max(0, m.start() - 300):hi]):
             continue
-        quote = text[lo:hi].strip()
-        return ("…" if lo > start else "") + quote + ("…" if hi < stop else "")
-    return ""
+        if stop - start <= _WHOLE_SENTENCE_CHARS:
+            lo, hi = start, stop
+        quote = ("…" if lo > start else "") + text[lo:hi].strip() + ("…" if hi < stop else "")
+        # a label's opening list runs straight into its first heading ('…autistic disorder
+        # 1.1 Schizophrenia…'): the indication's own section, further on, reads properly
+        if not _RUN_ON_HEADING_RE.search(quote):
+            return quote
+        fallback = fallback or quote
+    return fallback
 
 
 def _base_ingredients(generic: str) -> Tuple[str, ...]:

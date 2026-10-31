@@ -86,27 +86,43 @@ except Exception:
     cr = None
     HAS_CHAT = False
 
-# A code update on Streamlit Cloud re-runs this script but keeps helper modules
-# already imported by the running server — a new chem_v4 then meets an OLD
-# chem_sources ("has no attribute 'openfda_drugs_for_condition'"). Reload stale ones.
-import importlib as _importlib
-if not hasattr(cs, "openfda_drugs_for_condition"):
-    cs = _importlib.reload(cs)
-if cr is not None and not hasattr(cr, "condition_search"):
-    cr = _importlib.reload(cr)
-
-# Short written answers from Claude Haiku; the rule-based answer is the fallback.
+# Short written answers from Claude; the rule-based answer is the fallback.
 try:
     import ai_answer as ai
     HAS_AI = True
 except Exception:
     ai = None
     HAS_AI = False
-if ai is not None and not hasattr(ai, "cost_sgd"):
-    ai = _importlib.reload(ai)
 
 # Local log of user-reported data problems (no Streamlit, no network).
 import data_reports as drp
+
+# A code update on Streamlit Cloud re-runs this script but keeps helper modules
+# already imported by the running server — a new chem_v4 then meets an OLD
+# chem_sources ("has no attribute 'openfda_drugs_for_condition'"). Reload stale ones.
+import importlib as _importlib
+
+
+def _up_to_date(module, newest: str = "__name__"):
+    """Reload a helper whose file has changed. `newest` is something only its current version
+    has, for a server that loaded it before this note of the file's time was kept."""
+    if module is None:
+        return None
+    changed = os.path.getmtime(module.__file__)
+    if not hasattr(module, newest) or getattr(module, "_file_time", changed) != changed:
+        module = _importlib.reload(module)
+    module._file_time = changed
+    return module
+
+
+cs = _up_to_date(cs, "_WHOLE_SENTENCE_CHARS")
+ci = _up_to_date(ci)
+dl = _up_to_date(dl)
+mref = _up_to_date(mref)
+sgr = _up_to_date(sgr, "availability_by_route")
+cr = _up_to_date(cr, "condition_search")
+ai = _up_to_date(ai, "outline")
+drp = _up_to_date(drp)
 
 # Optional Streamlit
 HAS_STREAMLIT = False
@@ -726,7 +742,9 @@ if HAS_STREAMLIT:
         except _NoCache as e:
             _fn, hosts, is_empty = _FETCHERS[tag]
             empty = is_empty(e.result) if is_empty else not e.result
-            if empty and _failing(hosts):
+            # An overloaded openFDA also answers 404 for drugs it has, with nothing failing, so
+            # 'no label' for a known medicine isn't kept for the next six hours either
+            if empty and (_failing(hosts) or (tag == "openfda_label" and find_library_drug(args[0]))):
                 raise _Outage(tag)      # outage, not "doesn't exist" — retry next time
             return e.result
         except Exception:               # a fetcher bug/odd payload: don't cache it
@@ -3904,7 +3922,7 @@ def _assign_wiki_tabs(wiki_secs: Dict[str, Any]) -> None:
 
 
 def _clinical_enrichment(*, drug_hit, compound_name, resolved_name, synonyms,
-                         clin_chembl, region, inchikey="", extras=True) -> Dict[str, Any]:
+                         clin_chembl, region, inchikey="", extras=True, brands=True) -> Dict[str, Any]:
     """FDA label + FAERS + market (RxNorm/HSA) + GtoPdb for a compound.
 
     Fetched only when there's a prior drug signal (library membership or a
@@ -3961,9 +3979,10 @@ def _clinical_enrichment(*, drug_hit, compound_name, resolved_name, synonyms,
         # RxNorm's single-ingredient brands (Lipitor, Coumadin…) beat brand names
         # mined from label counts, which skew to store brands.
         market = dict(market)
-        market["rxnorm_brands"] = cached_rxnorm_brands(
-            (drug_hit or {}).get("rxcui", ""),
-            "" if drug_hit else (compound_name or resolved_name))
+        if brands:
+            market["rxnorm_brands"] = cached_rxnorm_brands(
+                (drug_hit or {}).get("rxcui", ""),
+                "" if drug_hit else (compound_name or resolved_name))
         if region == "SG" and HAS_SG_REGISTER:
             sg_names = [(drug_hit or {}).get("name"), compound_name, resolved_name,
                         *(openfda.get("generic_names") or [])[:1]]
@@ -4357,22 +4376,25 @@ def _prefer_medication_article(secs: Dict[str, Any], wiki: Dict[str, Any]
     return med, (cached_wiki(med["title"]) or wiki)
 
 
-def load_name_only(name: str, *, region: str = "US", drug=None, extras: bool = True) -> Dict[str, Any]:
+def load_name_only(name: str, *, region: str = "US", drug=None, extras: bool = True, wiki: bool = True) -> Dict[str, Any]:
     """Fallback context for a medicine with no small-molecule structure (a
     biologic such as insulin or adalimumab) or a name PubChem can't resolve:
     everything keyed by NAME — FDA label, Wikipedia, RxNorm/HSA brands — with
     no PubChem record, ChEMBL or structure. Same keys as load_compound().
-    Also the fast first read for an AI answer (extras=False: no FAERS or label counts)."""
+    Also the fast first read for an AI answer (extras=False: no FAERS or label counts;
+    wiki=False: no Wikipedia either)."""
     drug = drug or find_library_drug(name)
     title = (drug or {}).get("name") or name
+    want_wiki, wiki, wiki_secs = wiki, {}, {}
     # the spinner only for a full read: an AI answer has its own progress line (and may run in a thread)
     with st.spinner(f"Fetching FDA label and Wikipedia for {title}…") if extras else nullcontext():
-        wiki = cached_wiki(title) or (cached_wiki(name) if name != title else {})
-        wiki_secs = cached_wiki_sections(wiki.get("title") or title) or {}
-        wiki_secs, wiki = _prefer_medication_article(wiki_secs, wiki)
+        if want_wiki:
+            wiki = cached_wiki(title) or (cached_wiki(name) if name != title else {})
+            wiki_secs = cached_wiki_sections(wiki.get("title") or title) or {}
+            wiki_secs, wiki = _prefer_medication_article(wiki_secs, wiki)
         clinical = _clinical_enrichment(
             drug_hit=drug, compound_name=title, resolved_name=name, synonyms=[],
-            clin_chembl={}, region=region, extras=extras)
+            clin_chembl={}, region=region, extras=extras, brands=extras)
     _assign_wiki_tabs(wiki_secs)
     grouped = refine_pharma_topics(consolidate_grouped(merge_wiki_into_grouped({}, wiki_secs)),
                                    [title, name])
@@ -5069,8 +5091,13 @@ div[data-testid="stChatMessage"] li { margin-bottom: .3rem; line-height: 1.55; }
 .ans-box.ai-card { border-left-color: rgba(128,128,128,.45); background: rgba(128,128,128,.07); }
 .ai-red { background: rgba(239,68,68,.16); border-left: 3px solid #ef4444; }
 .ai-amber { background: rgba(234,179,8,.16); border-left: 3px solid #eab308; }
-.ai-points { margin: .55rem 0 0 0; padding-left: 1.15rem; }
-.ai-points li { margin-bottom: .2rem; }
+.ai-sec { font-weight: 600; font-size: .95rem; margin: .75rem 0 0 0; }
+.ai-points { margin: .3rem 0 0 0; padding-left: 1.15rem; font-size: .98rem; }
+.ai-points li { margin-bottom: .2rem; line-height: 1.5; }
+.ai-general { margin-left: .1rem; opacity: .7; cursor: help; }
+.ai-foot { margin-top: .6rem; font-size: .74rem; opacity: .62; }
+.ai-market { margin-top: .6rem; font-size: .86rem; line-height: 1.5; }
+.ai-market b { font-weight: 600; }
 .ai-chain { margin: .6rem 0 0 0; line-height: 2; }
 .ai-step { display: inline-block; padding: 0 .55rem; border-radius: .4rem; font-size: .9rem;
   line-height: 1.6; background: rgba(128,128,128,.14); border: 1px solid rgba(128,128,128,.28); }
@@ -5079,7 +5106,15 @@ div[data-testid="stChatMessage"] li { margin-bottom: .3rem; line-height: 1.55; }
 .ai-table { border-collapse: collapse; font-size: .92rem; width: 100%; }
 .ai-table th, .ai-table td { padding: .3rem .55rem; text-align: left; vertical-align: top;
   border-bottom: 1px solid rgba(128,128,128,.28); }
-.src-none { border-style: dashed; }
+.ai-col { display: none; }
+@media (max-width: 640px) {   /* three columns don't fit a phone: the second drug would be off-screen */
+  .ai-table, .ai-table tbody, .ai-table tr, .ai-table td { display: block; width: 100%; }
+  .ai-table tr:first-child { display: none; }
+  .ai-table tr { padding: .45rem 0; border-bottom: 1px solid rgba(128,128,128,.28); }
+  .ai-table td { border: 0 !important; padding: .08rem 0; }
+  .ai-table td:first-child { font-weight: 600; }
+  .ai-col { display: inline; opacity: .75; }
+}
 </style>
 """
 
@@ -5227,52 +5262,83 @@ def render_blocks(blocks: List[Dict[str, Any]], key: str, latest: bool = True):
                 render_faers_chart(b["v"])
             elif t == "html":
                 components.html(b["v"], height=b.get("height", 420))
-            elif t == "buttons" and latest and b.get("items"):
-                _render_button_row(b, k)
+            elif t == "buttons" and b.get("items"):
+                if latest:
+                    _render_button_row(b, k)
+                else:          # holds its place: see render_chat
+                    for _ in range(2 if b.get("title") else 1):
+                        st.empty()
             elif t == "ai_answer":
                 _render_ai_answer(b)
-            elif t == "profile" and latest and b.get("query"):
-                st.button(f"📖 Open the full {b.get('name') or ''} profile".replace("  ", " "),
-                          key=k, on_click=_open_drug, args=(b["query"],),
-                          help="Every tab — label sections, pharmacology, chemistry, "
-                               "safety and references — in the Explore view")
+            elif t == "ai_sources" and b.get("items"):
+                with st.expander(f"Source text ({len(b['items'])})"):
+                    st.markdown(_ai_sources_md(b["items"]), unsafe_allow_html=True)
+            elif t == "profile" and b.get("query"):
+                if latest:
+                    st.button(f"📖 Open the full {b.get('name') or ''} profile".replace("  ", " "),
+                              key=k, on_click=_open_drug, args=(b["query"],),
+                              help="Every tab — label sections, pharmacology, chemistry, "
+                                   "safety and references — in the Explore view")
+                else:
+                    st.empty()
         except Exception as e:  # noqa: BLE001 — one bad block mustn't sink the chat
             st.caption(f"(couldn't display part of this answer: {e})")
 
 
+_AI_GENERAL_MARK = "<sup class='ai-general' title='General knowledge, not from a linked source'>†</sup>"
+
+
 def _ai_claim_html(text: str, sources: List[Tuple[str, str]]) -> str:
     badges = "".join(_badge(s, u) for s, u in sources)
-    return _inline_html(text) + (badges or " <span class='src src-none'>not from a source</span>")
+    return _inline_html(text) + (badges or _AI_GENERAL_MARK)
 
 
 def _render_ai_answer(b: Dict[str, Any]):
-    """The answer card: the answer, then what could change what the reader does,
-    then only the extras the question called for. The exact source text stays one
-    tap away — it's what a general chatbot can't offer."""
-    parts = [f"<div class='ai-head'>{_ai_claim_html(b['headline'], b['sources'])}</div>"]
-    for item in b.get("safety") or []:
-        icon = "🔴" if item["level"] == "red" else "⚠️"
-        parts.append(f"<div class='ai-safety ai-{item['level']}'>{icon} "
-                     f"{_ai_claim_html(item['text'], item['sources'])}</div>")
+    """The answer card: the direct answer and anything life-threatening, then the rest
+    of the answer, then cautions. A line no source backs carries a † explained at the foot."""
+    safety = b.get("safety") or []
+
+    def warnings(level: str) -> List[str]:
+        icon = "🔴" if level == "red" else "⚠️"
+        return [f"<div class='ai-safety ai-{level}'>{icon} {_ai_claim_html(s['text'], s['sources'])}</div>"
+                for s in safety if s["level"] == level]
+
+    parts = [f"<div class='ai-head'>{_ai_claim_html(b['headline'], b['sources'])}</div>"] + warnings("red")
     if b.get("chain"):
         steps = "<span class='ai-arrow'>→</span>".join(
             f"<span class='ai-step'>{_inline_html(s)}</span>" for s in b["chain"])
-        parts.append(f"<div class='ai-chain'>{steps}{''.join(_badge(s, u) for s, u in b['chain_sources'])}</div>")
-    if b.get("points"):
-        items = "".join(f"<li>{_ai_claim_html(p['text'], p['sources'])}</li>" for p in b["points"])
-        parts.append(f"<ul class='ai-points'>{items}</ul>")
+        parts.append(f"<div class='ai-chain'>{steps}"
+                     f"{''.join(_badge(s, u) for s, u in b['chain_sources']) or _AI_GENERAL_MARK}</div>")
     if b.get("table_rows"):
         head = "".join(f"<th>{_inline_html(c)}</th>" for c in b["table_columns"])
-        rows = "".join(
-            "<tr>" + "".join(f"<td>{_inline_html(c)}</td>" for c in row["cells"][:-1])
-            + f"<td>{_ai_claim_html(row['cells'][-1], row['sources'])}</td></tr>"
-            for row in b["table_rows"])
+        # A phone stacks each row (see .ai-col), so there a cell has to say which drug it's about
+        labels = [""] + [f"<span class='ai-col'>{_inline_html(c)}: </span>" for c in b["table_columns"][1:]]
+        rows = ""
+        for row in b["table_rows"]:
+            cells = [label + _inline_html(c) for label, c in zip(labels, row["cells"])]
+            cells[-1] += "".join(_badge(s, u) for s, u in row["sources"]) or _AI_GENERAL_MARK
+            rows += "<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>"
         parts.append(f"<div class='ai-table-wrap'><table class='ai-table'><tr>{head}</tr>{rows}</table></div>")
+    for sec in b.get("sections") or []:
+        if sec.get("title"):
+            parts.append(f"<div class='ai-sec'>{_inline_html(sec['title'])}</div>")
+        items = "".join(f"<li>{_ai_claim_html(p['text'], p['sources'])}</li>" for p in sec["points"])
+        parts.append(f"<ul class='ai-points'>{items}</ul>")
+    if b.get("market"):
+        groups = " · ".join(f"{label.lower()} <b>{_html.escape(names)}</b>" if label in ("All", "Both") else
+                            f"<b>{_html.escape(label)}:</b> {_html.escape(names)}" for label, names in b["market"])
+        parts.append(f"<div class='ai-market'>In Singapore: {groups}{_badge('HSA register')}</div>")
+    parts += warnings("amber")
+    if any(_AI_GENERAL_MARK in p for p in parts):
+        parts.append("<div class='ai-foot'>† General knowledge, not from a linked source.</div>")
     # neutral, so that colour in the card only ever means a warning
     st.markdown("<div class='ans-box ai-card'>" + "".join(parts) + "</div>", unsafe_allow_html=True)
-    if b.get("evidence"):
-        with st.expander(f"Exact source text ({len(b['evidence'])})"):
-            st.markdown(_points_md(b["evidence"]), unsafe_allow_html=True)
+
+
+def _ai_sources_md(items: Sequence[Tuple[str, str, str, str]]) -> str:
+    """The sentences behind the answer, each under the drug and section it came from."""
+    return "\n".join(f"- {'**' + _md_safe(where) + ':** ' if where else ''}{_md_safe(_tidy(text))}{_badge(src, url)}"
+                     for where, text, src, url in items)
 
 
 _PROFILE_PREFIX = "__profile__:"
@@ -8809,7 +8875,7 @@ _REMEDY_RE = re.compile(r"\bcan be (?:avoided|prevented|reduced|minimi[sz]ed|tre
                         r"reversed)\b|\b(?:are|is) (?:often |usually )?switched to\b|"
                         r"\bavoided by\b|\bmanaged by\b", re.I)
 # A sentence that only makes sense with the one before it ('This mechanism…').
-_ANAPHOR_START_RE = re.compile(r"^(?:This|These|That|Those|Such|It|Thus|Therefore|Hence|"
+_ANAPHOR_START_RE = re.compile(r"^(?:This|These|That|Those|Such|It|Its|They|Their|Both|Thus|Therefore|Hence|"
                                r"Consequently|As a result)\b")
 
 
@@ -9853,10 +9919,22 @@ def _help_blocks() -> List[Dict[str, Any]]:
 
 
 # ---- AI answers: Claude Haiku writes, the app's sources supply the facts ----
-_ABOUT_AI = ("Answers are written by AI (Claude Haiku) from FDA labels, ChEMBL, PubChem, Wikipedia and "
+_ABOUT_AI = ("Answers are written by AI (Claude) from FDA labels, ChEMBL, PubChem, Wikipedia and "
              "the HSA register, and each links its source. Your question is sent to Anthropic. "
              "Not medical advice.")
 _AI_DAILY_LIMIT, _AI_SESSION_LIMIT = 200, 40     # override with AI_DAILY_LIMIT / AI_SESSION_LIMIT
+_AI_DETAILED_DRUGS, _AI_MAX_CHIPS, _AI_MAX_PROFILES = 3, 3, 2
+_AI_LIST_LABELS, _AI_LIST_BUDGET_S, _AI_LIST_TOPICS = 8, 8.0, ["uses", "side_effects"]
+_AI_NAMED_DRUG_EXTRA_S = 4.0                     # a drug asked about by name is worth waiting longer for
+_AI_LATE_ARTICLE_S = 2.0                         # on top, for an article instead of a label still coming
+_AI_TOOLS_BUDGET_S = 16.0                        # after this long the answer is written from what's in hand
+_AI_PLAN_SNIPPETS, _AI_PLAN_SENTENCE_CHARS = 24, 600   # sentences looked up by what the outline says
+_AI_LOOKUP_SHAPES = {"drugs_for", "drugs_causing"}   # the outline's drugs are looked up for these…
+_AI_LOOKUP_IF_UNNAMED = {"compare", "population", "can_i"}   # …and these, if the question names no drug
+_AI_TABLE_TEXT_RE = re.compile(r"System/Organ Class|Percentage of Patients|Adverse Reactions? in ≥", re.I)
+_AI_COMMON_EFFECTS_RE = re.compile(r"\b(?:most common|commonly observed|most frequent)", re.I)
+_AI_TREATMENT_SECTION_RE = re.compile(r"manag|treat|therap|medic|pharmac|drug", re.I)
+_AI_NOT_TREATMENT_SECTION_RE = re.compile(r"alternative|complementary|history|society|research", re.I)
 _AI_FIXED_MODES = {"empty", "help", "thanks", "crisis", "refuse", "pets"}
 # Drawn or calculated rather than written: the structure image, RDKit properties…
 _AI_CHEMISTRY_INTENTS = {"structure", "properties", "spectra", "identifiers"}
@@ -9893,11 +9971,26 @@ def _ai_entity(name: str) -> Dict[str, Any]:
     return dict(ents[0]) if ents else {"kind": "free", "query": name, "display": name}
 
 
-def _ai_corpus_snippets(ctx, name, topics, keywords, per_topic: int = 12) -> List[Dict[str, str]]:
+def _ai_corpus(ctx) -> List[Dict[str, str]]:
+    """The record's sentences an answer can rest on. A flattened table is left out: which number
+    belongs to which column is lost, so it invites a wrong figure. A sentence opening with 'Its'
+    keeps the one before it: on its own, norfluoxetine's 'Its mean terminal half-life was 8.6 days'
+    was read as fluoxetine's."""
+    docs = _chat_corpus(ctx)
+    out = []
+    for i, d in enumerate(docs):
+        if not _CODE_LIST_RE.search(d["text"]) and not _AI_TABLE_TEXT_RE.search(d["text"]):
+            before = docs[i - 1] if i else {}
+            joined = _ANAPHOR_START_RE.match(d["text"]) and before.get("section") == d["section"] and before.get("src") == d["src"]
+            out.append(dict(d, text=f"{before['text']} {d['text']}") if joined else d)
+    return out
+
+
+def _ai_corpus_snippets(ctx, name, topics, keywords, per_topic: int = 12, keyword_hits: int = 8) -> List[Dict[str, str]]:
     """The record's sentences for these topics: those matching the keywords, then the
     rest in record order (FDA label first). Keyword hits outside the topics count too:
     a dose for one indication can sit anywhere in a label."""
-    docs = [d for d in _chat_corpus(ctx) if not _CODE_LIST_RE.search(d["text"])]
+    docs = _ai_corpus(ctx)
     weights = cr.expand_terms(list(keywords)) if keywords else {}
 
     def by_keywords(pool):
@@ -9918,10 +10011,13 @@ def _ai_corpus_snippets(ctx, name, topics, keywords, per_topic: int = 12) -> Lis
                 picked.append(d)
                 kept += 1
 
-    take(by_keywords(docs), 8)
+    take(by_keywords(docs), keyword_hits)
     for topic in topics:
         pool = [d for d in docs if d["topic"] == topic]
-        take(by_keywords(pool) + pool, per_topic)
+        if topic == "side_effects":      # stable: the label's own summary first, not its trial design
+            pool.sort(key=lambda d: not _AI_COMMON_EFFECTS_RE.search(d["text"]))
+        take(by_keywords(pool) + pool if topic != "side_effects" else
+             [d for d in pool if _AI_COMMON_EFFECTS_RE.search(d["text"])] + by_keywords(pool) + pool, per_topic)
     out = []
     if "dosing" in topics:
         out += _ai_label_sections(ctx, name, "dosage", "Dosage & administration", keywords)
@@ -9944,34 +10040,44 @@ def _ai_label_sections(ctx, name, field, title, keywords, size: int = 1500, keep
              "section": f"{name} · {title}"} for s in pieces[:keep]]
 
 
-def _ai_load(en: Dict[str, Any], opts: Dict[str, Any], topics: Sequence[str], want_market: bool) -> Dict[str, Any]:
+def _ai_load(en: Dict[str, Any], opts: Dict[str, Any], topics: Sequence[str], want_market: bool,
+             label_only: bool = False) -> Dict[str, Any]:
     """A medicine's data for an answer: the FDA label + Wikipedia only, which takes seconds
     rather than the full record's tens of seconds and covers most questions. Asking for the
-    same topics of the same medicine again means that wasn't enough: load it all."""
+    same topics of the same medicine again means that wasn't enough: load it all. With
+    `label_only`, one line of a list: the label or nothing."""
     name = en.get("query") or ""
     drug = find_library_drug(name, en.get("display"))
     read = opts.setdefault("_ai_light_read", {}).setdefault(name.lower(), set())
     known = drug or en.get("kind") in ("library", "alias", "brand")
     if known and not want_market and not set(topics) <= read:
         read.update(topics)
-        key = ("ai-light", name.lower(), opts["region"])
+        key = ("ai-label" if label_only else "ai-light", name.lower(), opts["region"])
         hit = _ctx_cache().get(key)
         if hit and hit.get("expires", 0) >= time.time():
             return {"ctx": hit["ctx"], "query": hit["query"]}
         _progress(opts, f"Reading the FDA label and Wikipedia on {en.get('display') or name}…")
-        ctx = load_name_only(name, region=opts["region"], drug=drug, extras=False)
+        ctx = load_name_only(name, region=opts["region"], drug=drug, extras=False, wiki=not label_only)
         if ctx.get("label") or (ctx.get("wiki") or {}).get("extract"):
             ctx["ai_light"] = True
             _ctx_store(key, rank=0, ctx=ctx, notes=[], query=name, others=[],
                        expires=time.time() + (60 if _sources_down(ctx) else 6 * 3600))
             return {"ctx": ctx, "query": name}
+    if label_only:
+        return {"error": "no label"}
     return _chat_load(en, opts, "full", extras=want_market)
+
+
+def _ai_not_listed(name: str) -> str:
+    """HSA's open data has no row for it. That isn't the same as not registered: it has no Cymbalta
+    or Strattera, and the National Drug Formulary has both with their licence numbers."""
+    return f"{name} isn't in HSA's open listing of registered products, which leaves some out, so its Singapore status isn't known here."
 
 
 def _ai_drug_tool(inp: Dict[str, Any], opts: Dict[str, Any]) -> List[Dict[str, str]]:
     name, topics, keywords = inp["drug"], inp.get("topics") or ["overview"], inp.get("keywords") or []
     en = _ai_entity(name)
-    loaded = _ai_load(en, opts, topics, "brands" in topics and opts["region"] != "SG")
+    loaded = _ai_load(en, opts, topics, "brands" in topics and opts["region"] != "SG", inp.get("_label_only", False))
     if loaded.get("error") or loaded.get("offline"):
         return []
     ctx = loaded["ctx"]
@@ -9981,7 +10087,9 @@ def _ai_drug_tool(inp: Dict[str, Any], opts: Dict[str, Any]) -> List[Dict[str, s
     if en.get("kind") == "brand" and en.get("ingredients"):
         out.append({"text": f"{en.get('display')} is a Singapore brand of {' + '.join(en['ingredients'])}.",
                     "src": "HSA register", "section": "Brand"})
-    if (ctx.get("drug_hit") or {}).get("classes") or ctx.get("clin_chembl") or ctx.get("wiki"):
+    # Only when asked what a drug is: seen beside a list, the model copies the chemical group
+    # ('Buspirone (azaspirodecanedione)') into an answer however it's told not to
+    if set(topics) & {"overview", "mechanism"} and ((ctx.get("drug_hit") or {}).get("classes") or ctx.get("clin_chembl") or ctx.get("wiki")):
         f = _ctx_glance(ctx)
         if f.get("classes"):
             out.append({"text": f"{shown} drug class: {' · '.join(f['classes'])}.",
@@ -9989,16 +10097,16 @@ def _ai_drug_tool(inp: Dict[str, Any], opts: Dict[str, Any]) -> List[Dict[str, s
                         "section": "Class"})
     if opts["region"] == "SG" and HAS_SG_REGISTER and set(topics) & {"brands", "overview", "uses"}:
         sg = sgr.lookup(loaded["query"], shown)
-        out.append({"text": f"{shown} in Singapore: {sgr.availability_text(sg)}. Brands: "
-                            f"{', '.join(sg['brands'][:12])}." if sg else
-                            f"No HSA-registered product containing {shown} was found in Singapore.",
+        by_route = sgr.availability_by_route(sg)
+        out.append({"text": f"{shown} in Singapore: {sgr.availability_text(sg)}{f'. By route: {by_route}' if by_route else ''}. "
+                            f"Brands: {', '.join(sg['brands'][:12])}." if sg else _ai_not_listed(shown),
                     "src": "HSA register", "section": "Availability"})
     if "brands" in topics and opts["region"] != "SG":
         us = _brand_names(ctx.get("market") or {}, ctx.get("label") or {}, shown)
         if us:
             out.append({"text": f"US brands of {shown}: {', '.join(us)}.", "src": "RxNorm", "section": "Brands"})
     return out + _ai_corpus_snippets(ctx, shown, [t for t in topics if t != "brands"], keywords,
-                                     inp.get("_per_topic", 12))
+                                     inp.get("_per_topic", 12), inp.get("_keyword_hits", 8))
 
 
 def _ai_condition_tool(inp: Dict[str, Any], opts: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -10009,12 +10117,12 @@ def _ai_condition_tool(inp: Dict[str, Any], opts: Dict[str, Any]) -> List[Dict[s
     res = cached_openfda_condition(tuple(terms)) or {}
     out: List[Dict[str, str]] = []
     for d in res.get("drugs") or []:
-        where = ""
+        out.append({"text": d["quote"], "src": "FDA label", "url": d.get("url", ""),
+                    "section": f"{d['name']} · Label use"})
         if sg and " + " not in d["name"]:
             summ = sgr.lookup(d["name"].lower(), d["name"])
-            where = f" (Singapore: {'/'.join(summ['classes'])})" if summ else " (not on the HSA register)"
-        out.append({"text": f"{d['name']}{where}, label says: “{d['quote']}”", "src": "FDA label",
-                    "url": d.get("url", ""), "section": f"Label use · {cond}"})
+            out.append({"text": f"{d['name']} in Singapore: {sgr.availability_text(summ)}." if summ else _ai_not_listed(d["name"]),
+                        "src": "HSA register", "section": f"{d['name']} · Availability"})
     atc = cr.find_condition(cond) if HAS_DRUG_LIBRARY else None
     for code in (atc[1] if atc else [])[:4]:
         names = [d["name"] for d in dl.drugs_in_class(code)
@@ -10034,10 +10142,15 @@ def _ai_encyclopedia_tool(inp: Dict[str, Any], opts: Dict[str, Any]) -> List[Dic
     secs = (cached_wiki_sections(title) if title else _search_article(subject)[0]) or {}
     if not secs:
         return []
+    opts.setdefault("_ai_articles", []).append(secs)
     src, url = _wsrc(secs)
-    lines = [(s, "Summary") for s in _definition(secs, 2)]
     terms = keywords or re.findall(r"[a-z0-9]+", subject.lower())
-    lines += [(s, path) for _sc, s, path in rank_article(_article_sents(secs), terms=terms, k=12)]
+    ranked = [(s, path) for _sc, s, path in rank_article(_with_antecedents(_article_sents(secs)), terms=terms, k=12)]
+    lines = [(s, "Summary") for s in _definition(secs, 2)] + ranked
+    if inp.get("_treatment_only"):       # 'drugs for X': not its causes, history or alternative medicine
+        about_treatment = [ln for ln in ranked if _AI_TREATMENT_SECTION_RE.search(ln[1])
+                           and not _AI_NOT_TREATMENT_SECTION_RE.search(ln[1])]
+        lines = about_treatment if len(about_treatment) >= 4 else lines
     seen: set = set()
     return [{"text": s, "src": src, "url": url, "section": path} for s, path in lines
             if not (s in seen or seen.add(s))]
@@ -10056,20 +10169,157 @@ def _ai_class_tool(inp: Dict[str, Any], opts: Dict[str, Any]) -> List[Dict[str, 
     return out
 
 
-def _ai_prefetch(p: Dict[str, Any], opts: Dict[str, Any]) -> List[Dict[str, str]]:
+def _ai_read_drugs(names: Sequence[str], topics: Sequence[str], keywords: Sequence[str], per_topic: int,
+                   opts: Dict[str, Any], deadline: float, keyword_hits: int = 8) -> List[Dict[str, str]]:
+    """Medicines' evidence: fetched at once into the cache, then read in order. One still
+    coming at the deadline carries on into the cache, and the answer goes without it: an
+    FDA request now and then takes 20 s."""
+    late: set = set()
+    if "brands" not in topics:
+        _progress(opts, f"Reading the FDA label and Wikipedia on {' and '.join(names)}…")
+        ex = ThreadPoolExecutor(max_workers=len(names))
+        futs = submit_all(ex, *[(_ai_load, _ai_entity(n), dict(opts, _ai_light_read={}, _progress=None), topics, False)
+                                for n in names])
+        futures_wait(futs, timeout=max(deadline - time.monotonic(), 0))
+        ex.shutdown(wait=False)
+        late = {n for n, fut in zip(names, futs) if not fut.done()}
+    out: List[Dict[str, str]] = []
+    for name in names:
+        if name not in late:
+            out += _ai_drug_tool({"drug": name, "topics": list(topics), "keywords": list(keywords),
+                                  "_per_topic": per_topic, "_keyword_hits": keyword_hits}, opts)
+    return out + _ai_articles_instead([n for n in names if n in late], list(keywords) + list(topics), opts)
+
+
+def _ai_articles_instead(names: Sequence[str], keywords: Sequence[str], opts: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Wikipedia on medicines whose FDA label is holding them up, so the answer still has a source.
+    A load reads the article before the label, so it's nearly always here already."""
+    if not names:
+        return []
+    ex = ThreadPoolExecutor(max_workers=len(names))
+    futs = submit_all(ex, *[(_ai_encyclopedia_tool, {"subject": n, "_title": n, "keywords": list(keywords)}, dict(opts, _progress=None))
+                            for n in names])
+    futures_wait(futs, timeout=_AI_LATE_ARTICLE_S)
+    ex.shutdown(wait=False)
+    return [s for fut in futs if fut.done() for s in _quiet_result(fut) or []]
+
+
+class _AiLabelLoads:
+    """FDA labels being fetched at once for a list of medicines: the label search and the
+    specialist's outline each ask for the ones they name, and none is fetched twice. Labels
+    only: a burst of Wikipedia articles gets the whole app rate-limited for minutes."""
+
+    def __init__(self, opts: Dict[str, Any]):
+        self.opts, self.words, self.futs = opts, {}, {}
+        self.ex = ThreadPoolExecutor(max_workers=_AI_LIST_LABELS)
+        self.lock = threading.Lock()
+
+    def want(self, name: str, words: Sequence[str] = ()):
+        with self.lock:
+            if name.lower() not in self.futs and len(self.futs) < _AI_LIST_LABELS:
+                quiet = dict(self.opts, _ai_light_read={}, _progress=None)
+                self.futs[name.lower()] = (name, submit_all(self.ex, (_ai_load, _ai_entity(name), quiet, _AI_LIST_TOPICS,
+                                                                      False, True))[0])
+            self.words.setdefault(name.lower(), []).extend(words)
+
+    def read(self, deadline: float) -> List[Dict[str, str]]:
+        """The evidence from those in by the deadline. The rest carry on into the cache."""
+        with self.lock:
+            futs = list(self.futs.items())
+        done, _late = futures_wait([fut for _key, (_name, fut) in futs], timeout=max(deadline - time.monotonic(), 0))
+        self.ex.shutdown(wait=False)
+        out: List[Dict[str, str]] = []
+        for key, (name, fut) in futs:
+            # 'No label' is an answer. Asking again would hold everything up past the deadline, for nothing
+            if fut in done and not (_quiet_result(fut) or {}).get("error"):
+                out += _ai_drug_tool({"drug": name, "topics": _AI_LIST_TOPICS, "keywords": self.words[key],
+                                      "_per_topic": 3, "_keyword_hits": 4, "_label_only": True}, self.opts)
+        return out
+
+
+def _ai_plan_snippets(plan: Dict[str, Any], opts: Dict[str, Any]) -> List[Dict[str, str]]:
+    """The sentences already loaded that say what the outline says, so its lines can cite them
+    and a source can correct them. The look-up had only the question's own words to go on, and
+    'what is serotonin syndrome' finds every sentence with those words in, not the symptoms."""
+    pool: List[Dict[str, str]] = []
+    read: set = set()
+    for en, ctx, _query in opts.get("_ai_seen") or []:
+        if id(ctx) not in read:
+            read.add(id(ctx))
+            shown = _chat_name(ctx, en)
+            pool += [{"text": d["text"], "src": d["src"], "url": d.get("url", ""),
+                      "section": f"{shown} · {d.get('section') or d['topic']}"} for d in _ai_corpus(ctx)]
+    for secs in opts.get("_ai_articles") or []:
+        src, url = _wsrc(secs)
+        pool += [{"text": s, "src": src, "url": url, "section": path} for s, path in _with_antecedents(_article_sents(secs))]
+    pool = [d for d in pool if len(d["text"]) <= _AI_PLAN_SENTENCE_CHARS]
+    lines = list(plan["lines"]) + ([plan["warning"]] if plan.get("warning") else [])
+    return [pool[i] for i in ai.sentences_saying(lines, [d["text"] for d in pool])][:_AI_PLAN_SNIPPETS]
+
+
+# 'Aldosterone antagonists' and 'calcium channel blockers' are drug classes, and 'lowers
+# aldosterone' and 'low sodium' say what happens in the body: none of them names a medicine
+_AI_DRUG_ROLE_RE = re.compile(r"\b[\w-]+(?: receptor| reuptake| channel)? (?:antagonist|agonist|blocker|inhibitor|analogue|analog)s?\b"
+                              r"|\b[\w-]+ channels?\b", re.I)
+_AI_BODY_SUBSTANCES = {"aldosterone", "angiotensin", "bradykinin", "calcium", "dopamine", "glutathione", "histamine", "magnesium",
+                       "potassium", "prostaglandin", "renin", "serotonin", "sodium", "urea"}
+
+
+def _ai_named_drugs(text: str) -> List[Dict[str, Any]]:
+    """The medicines a line of an answer names, each once."""
+    found = {}
+    for e in cr.parse_query(_AI_DRUG_ROLE_RE.sub(" ", text.replace("*", ""))).get("entities") or []:
+        name = (e.get("display") or e["query"]).lower()
+        if e.get("kind") in ("library", "alias", "brand") and name not in _AI_BODY_SUBSTANCES:
+            found.setdefault(name, e)
+    return list(found.values())
+
+
+def _ai_outline_then_labels(text: str, client: Any, history, p: Dict[str, Any], loads: _AiLabelLoads, opts: Dict[str, Any]):
+    """A specialist's outline, then at once the labels of the medicines a list of them names,
+    while the rest of the evidence comes in: its lines can then cite a source rather than
+    rest on the model's memory."""
+    plan = ai.outline(text, client=client, region=opts["region"], history=history, usage=opts["_ai_usage"],
+                      model=_ai_secret("AI_OUTLINE_MODEL", ai.OUTLINE_MODEL))
+    if plan and (plan["shape"] in _AI_LOOKUP_SHAPES or (plan["shape"] in _AI_LOOKUP_IF_UNNAMED and not p.get("entities"))):
+        lines = [(_ai_named_drugs(line), [w for w in re.findall(r"[a-z0-9\-]{4,}", line.lower()) if w not in cr.STOPWORDS])
+                 for line in plan["lines"]]
+        # Each line's first drug first: there's a limit, and it shouldn't go on three of one class
+        for turn in range(max((len(named) for named, _words in lines), default=0)):
+            for named, words in lines:
+                if turn < len(named):
+                    loads.want(named[turn].get("display") or named[turn]["query"], words)
+    return plan
+
+
+def _ai_prefetch(p: Dict[str, Any], opts: Dict[str, Any], loads: _AiLabelLoads, deadline: float) -> List[Dict[str, str]]:
     """What the parser can already tell is needed, so a plain drug question takes
-    one model call rather than two (it asks for more if this isn't enough)."""
+    one model call rather than two (it asks for more if this isn't enough). A list of
+    medicines stops waiting at the deadline: one label search can take 13 s, and the
+    rest of the answer doesn't need it. It carries on into the cache for next time."""
     mode = p.get("mode")
     keywords = [w for w in re.findall(r"[a-z0-9\-]{3,}", (p.get("raw") or "").lower()) if w not in cr.STOPWORDS]
     med_words = ["medication", "drug", "treatment"]
     out: List[Dict[str, str]] = []
     if mode == "condition":
         cond = p["condition"]
+        asked = cond.get("asked") or cond["label"]
         wiki = cond.get("wiki") or _CONDITION_WIKI.get(cond["label"], "")
-        out += _ai_condition_tool({"condition": cond.get("asked") or cond["label"],
-                                   "label_terms": cond.get("search") or []}, opts)
-        out += _ai_encyclopedia_tool({"subject": cond.get("asked") or cond["label"], "_title": wiki,
-                                      "keywords": med_words}, opts)
+        quiet = dict(opts, _progress=None)
+        ex = ThreadPoolExecutor(max_workers=2)
+        futs = submit_all(
+            ex, (_ai_condition_tool, {"condition": asked, "label_terms": cond.get("search") or []}, quiet),
+            (_ai_encyclopedia_tool, {"subject": asked, "_title": wiki, "keywords": med_words,
+                                     "_treatment_only": True}, quiet))
+        futures_wait(futs, timeout=max(deadline - time.monotonic(), 0))
+        ex.shutdown(wait=False)
+        found, article = [(_quiet_result(f) or []) if f.done() else [] for f in futs]
+        out += found + article
+        # A short list is the answer itself: what sets each one apart comes from its own label
+        named = [s["section"].split(" · ")[0] for s in found if s["src"] == "FDA label"]
+        if 0 < len(named) <= _AI_DETAILED_DRUGS and not any(" + " in n for n in named):
+            for name in named:
+                loads.want(name, list(cond.get("search") or []) + [asked])
         return out
     if mode == "concept":
         for c in (p.get("concepts") or [])[:2] or [{"label": p.get("concept_query") or ""}]:
@@ -10087,7 +10337,8 @@ def _ai_prefetch(p: Dict[str, Any], opts: Dict[str, Any]) -> List[Dict[str, str]
         rest = [w for w in keywords if w not in subject.lower().split()]
         return out + _ai_encyclopedia_tool({"subject": subject, "_title": first.get("wiki", ""),
                                             "keywords": rest}, opts)
-    ents = [e for e in p.get("entities") or [] if e.get("kind") in ("library", "alias", "brand")][:2]
+    # A drug carried over from the last question ('is it safe in pregnancy') was recognised then
+    ents = [e for e in p.get("entities") or [] if e.get("kind") in ("library", "alias", "brand") or p.get("used_context")][:2]
     if not ents or mode not in ("answer", "interaction", "compare", "relation", "multi"):
         return []
     topics: List[str] = []
@@ -10104,16 +10355,8 @@ def _ai_prefetch(p: Dict[str, Any], opts: Dict[str, Any]) -> List[Dict[str, str]
         topics, per_topic = ["mechanism", "pk", "side_effects", "interactions", "uses", "pregnancy"], 7
         keywords = ["half-life", "metabolite", "metabolized", "CYP", "contraindicated", "common"]
     topics = list(dict.fromkeys(topics)) or ["overview"]
-    names = [e.get("display") or e.get("query") for e in ents]
-    if len(names) > 1 and "brands" not in topics:
-        # two drugs: fetch both at once into the cache, then read them in order
-        with ThreadPoolExecutor(max_workers=len(names)) as ex:
-            for fut in submit_all(ex, *[(_ai_load, _ai_entity(n), dict(opts, _ai_light_read={}), topics, False)
-                                        for n in names]):
-                _quiet_result(fut)
-    for name in names:
-        out += _ai_drug_tool({"drug": name, "topics": topics, "keywords": keywords, "_per_topic": per_topic}, opts)
-    return out
+    return _ai_read_drugs([e.get("display") or e.get("query") for e in ents], topics, keywords, per_topic, opts,
+                          deadline + _AI_NAMED_DRUG_EXTRA_S)
 
 
 def _ai_history(opts: Dict[str, Any]) -> List[Tuple[str, str]]:
@@ -10132,6 +10375,55 @@ def _ai_history(opts: Dict[str, Any]) -> List[Tuple[str, str]]:
     return pairs
 
 
+_AI_NOT_LISTED = "Not in HSA's open data"
+
+
+def _ai_market_line(a: Dict[str, Any], opts: Dict[str, Any]) -> List[Tuple[str, List[str]]]:
+    """Where the medicines a list or comparison names stand in Singapore, as (status, names).
+    From the register itself rather than the model's wording, so it's right every time, and
+    in one line rather than repeated on each."""
+    if opts["region"] != "SG" or not HAS_SG_REGISTER:
+        return []
+    if a["shape"] == "drugs_for":
+        texts = [a["headline"]] + [p["text"] for sec in a["sections"] for p in sec["points"]]
+    else:                # not the other drugs a comparison mentions, like what a statin interacts with
+        texts = a["table_columns"]
+    groups: Dict[str, List[str]] = {}
+    seen: set = set()
+    for text in texts:
+        for e in _ai_named_drugs(text):
+            name = e.get("display") or e["query"]
+            if name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            summ = sgr.lookup(e.get("query"), name)
+            classes = (summ or {}).get("classes") or []
+            if e.get("kind") == "brand":      # Panadol itself, not everything with paracetamol in it
+                own = {p["cls"] for p in summ["products"] if sgr.brand_of(p["name"]).lower().startswith(name.lower())} if summ else ()
+                classes = [c for c in sgr.CLASS_ORDER if c in own] or classes
+            if not classes:
+                status = _AI_NOT_LISTED
+            elif len(classes) > 1:
+                status = f"{', '.join(classes[:-1])} or {classes[-1]} by product"
+            else:
+                status = f"{sgr.CLASS_LABEL[classes[0]]} ({classes[0]})"
+            groups.setdefault(status, []).append(f"{name} (in combinations only)" if summ and summ["combination_only"] else name)
+    if not groups:
+        return []
+    if len(groups) > 3:      # by then, what matters is which can be bought at all
+        fixed = {"Prescription-only (POM)", _AI_NOT_LISTED}
+        over_counter = [name for status, names in groups.items() if status not in fixed for name in names]
+        groups = dict({"Some without prescription": over_counter}, **{s: n for s, n in groups.items() if s in fixed})
+    # Thirteen drug names to say they all need a prescription is the clutter this line is here to remove
+    total = sum(len(names) for names in groups.values())
+    most = max(groups, key=lambda status: len(groups[status]))
+    if len(groups) == 1 and total > 1:
+        return [("Both" if total == 2 else "All", most)]
+    if total >= 4 and len(groups[most]) * 2 > total and most != "Some without prescription":
+        return [(status, ", ".join(names)) for status, names in groups.items() if status != most] + [("The rest", most)]
+    return [(status, ", ".join(names)) for status, names in groups.items()]
+
+
 def _ai_blocks(res: Dict[str, Any], opts: Dict[str, Any]) -> List[Dict[str, Any]]:
     """A verified answer → display blocks (plain data, replayed with the transcript)."""
     a, ev = res["answer"], res["evidence"]
@@ -10142,25 +10434,40 @@ def _ai_blocks(res: Dict[str, Any], opts: Dict[str, Any]) -> List[Dict[str, Any]
     if a["kind"] in ("off_topic", "clarify"):
         return [_b("md", v=_md_safe(a["headline"]))]
 
-    def sources(ids):
-        return list(dict.fromkeys((ev[i]["src"], ev[i]["url"]) for i in ids))
+    def chip(s):
+        # 'FDA label' twice in a row says nothing: name which label
+        name = s["section"].split(" · ")[0] if s["src"] == "FDA label" and " · " in s["section"] else ""
+        return (f"FDA: {name}" if name else s["src"]), s["url"]
 
-    cited = list(dict.fromkeys(
-        a["headline_sources"] + a["chain_sources"]
-        + [i for group in ("safety", "points", "table_rows") for item in a[group] for i in item["sources"]]))
+    def sources(ids):
+        return list(dict.fromkeys(chip(ev[i]) for i in ids))[:_AI_MAX_CHIPS]
+
+    points = [p for sec in a["sections"] for p in sec["points"]]
+    claims: Dict[str, List[str]] = {}
+    for text, ids in ([(a["headline"], a["headline_sources"]), (" ".join(a["chain"]), a["chain_sources"])]
+                      + [(c["text"], c["sources"]) for c in a["safety"] + points]
+                      + [(" ".join(r["cells"]), r["sources"]) for r in a["table_rows"]]):
+        for i in ids:
+            claims.setdefault(i, []).append(text)
     blocks = [_b("ai_answer", headline=a["headline"], sources=sources(a["headline_sources"]),
                  safety=[dict(s, sources=sources(s["sources"])) for s in a["safety"]],
-                 points=[dict(s, sources=sources(s["sources"])) for s in a["points"]],
+                 sections=[{"title": sec["title"],
+                            "points": [dict(p, sources=sources(p["sources"])) for p in sec["points"]]}
+                           for sec in a["sections"]],
                  chain=a["chain"], chain_sources=sources(a["chain_sources"]),
                  table_columns=a["table_columns"],
                  table_rows=[dict(r, sources=sources(r["sources"])) for r in a["table_rows"]],
-                 evidence=[(ev[i]["text"], ev[i]["src"], ev[i]["url"]) for i in cited])]
+                 market=_ai_market_line(a, opts))]
     nxt = [(q if len(q) <= 48 else q[:45] + "…", q) for q in a["followups"]]
-    seen = opts.get("_ai_seen") or []
-    if seen and (seen[-1][1].get("ai_light") or not seen[-1][1].get("name_only")):
-        nxt.append(("📖 Full profile", _PROFILE_PREFIX + seen[-1][2]))
+    profiles = {_chat_name(ctx, en): query for en, ctx, query in opts.get("_ai_seen") or []
+                if ctx.get("ai_light") or not ctx.get("name_only")}
+    nxt += [(f"📖 {name} profile" if len(profiles) > 1 else "📖 Full profile", _PROFILE_PREFIX + query)
+            for name, query in list(profiles.items())[:_AI_MAX_PROFILES]]
     if nxt:
         blocks.append(_b("buttons", items=nxt))
+    if claims:
+        blocks.append(_b("ai_sources", items=[(ev[i]["section"], ai.excerpt(ev[i]["text"], said),
+                                               ev[i]["src"], ev[i]["url"]) for i, said in claims.items()]))
     return blocks
 
 
@@ -10192,10 +10499,23 @@ def _ai_respond(text: str, opts: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         opts["_ai_note"] = "The AI answer limit has been reached for now, so this is the source text directly."
         return None
     st.session_state["ai_questions"] = used + 1
-    tools = {"get_drug_evidence": lambda i: _ai_drug_tool(i, opts),
-             "find_drugs_for_condition": lambda i: _ai_condition_tool(i, opts),
-             "search_encyclopedia": lambda i: _ai_encyclopedia_tool(i, opts),
-             "list_drugs_in_class": lambda i: _ai_class_tool(i, opts)}
+    started = time.monotonic()
+
+    def in_time(fn):
+        """A source the model asks for gets until the budget runs out: FDA requests now and then
+        take 20 s, and by then the reader is better off with the answer. It still reaches the cache."""
+        def call(inp):
+            ex = ThreadPoolExecutor(max_workers=1)
+            fut = submit_all(ex, (fn, inp, opts))[0]
+            futures_wait([fut], timeout=max(started + _AI_TOOLS_BUDGET_S - time.monotonic(), 0))
+            ex.shutdown(wait=False)
+            if not fut.done():
+                raise TimeoutError("still fetching")
+            return fut.result()
+        return call
+
+    tools = {"get_drug_evidence": in_time(_ai_drug_tool), "find_drugs_for_condition": in_time(_ai_condition_tool),
+             "search_encyclopedia": in_time(_ai_encyclopedia_tool), "list_drugs_in_class": in_time(_ai_class_tool)}
 
     def on_tool(name, inp):
         _progress(opts, {"get_drug_evidence": f"Reading the sources on {inp.get('drug', '')}…",
@@ -10203,13 +10523,22 @@ def _ai_respond(text: str, opts: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                          "list_drugs_in_class": f"Listing {inp.get('drug_class', '')}…"
                          }.get(name, "Checking the sources…"))
 
-    opts["_ai_usage"] = {}
+    opts["_ai_usage"], opts["_ai_articles"] = {}, []
     try:
-        prefetched = _ai_prefetch(p, opts)
+        client = ai.make_client(_ai_secret("ANTHROPIC_API_KEY"))
+        deadline = started + _AI_LIST_BUDGET_S
+        loads = _AiLabelLoads(opts)
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            planned = submit_all(ex, (_ai_outline_then_labels, text, client, history, p, loads, opts))[0]
+            prefetched = _ai_prefetch(p, opts, loads, deadline)
+        plan = _quiet_result(planned)
+        prefetched = prefetched + loads.read(deadline)
+        if plan and plan.get("lines"):
+            prefetched = prefetched + _ai_plan_snippets(plan, opts)
         _progress(opts, "Writing the answer…")
-        res = ai.answer(text, client=ai.make_client(_ai_secret("ANTHROPIC_API_KEY")), tools=tools,
-                        region=opts["region"], audience=audience, today=today, history=history,
-                        prefetched=prefetched, on_tool=on_tool, usage=opts["_ai_usage"])
+        res = ai.answer(text, client=client, tools=tools, region=opts["region"], audience=audience, today=today,
+                        history=history, prefetched=prefetched, on_tool=on_tool, usage=opts["_ai_usage"], plan=plan,
+                        tools_until=started + _AI_TOOLS_BUDGET_S)
     except Exception as e:  # noqa: BLE001 — any API trouble: the rule-based answer still works
         opts["_ai_note"] = "The AI answer isn't available just now, so this is the source text directly."
         if opts.get("debug_mode"):
@@ -10222,13 +10551,13 @@ def _ai_respond(text: str, opts: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
     seen = opts.get("_ai_seen") or []
     ctx_out = {}
-    if seen:
+    if seen and p["mode"] != "condition":       # a list of drugs has no single 'it' to carry on
         en, ctx, query = seen[-1]
         ctx_out = {"entity": {"kind": "free", "query": query, "display": _chat_name(ctx, en)},
                    "intents": list(intents)}
     if ctx_out:
         st.session_state["chat_context"] = ctx_out
-    reply = {"blocks": _ai_blocks(res, opts), "text": res["answer"]["headline"], "context": ctx_out,
+    reply = {"blocks": _ai_blocks(res, opts), "text": ai.plain_text(res["answer"]), "context": ctx_out,
              "kind": res["answer"]["kind"], "general": res["answer"]["general"]}
     if not history:
         ai.remember_answer(key, reply)
@@ -10241,7 +10570,7 @@ def _ai_cost_note(opts: Dict[str, Any]) -> str:
     if not _ai_ready():
         return ""
     usage = opts.get("_ai_usage") or {}
-    tokens = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+    tokens = ai.total_tokens(usage)
     if not tokens:
         return " · 0 tokens · S\\$0" + (" (saved answer)" if opts.get("_ai_saved") else "")
     # Escaped: a bare $ can start a maths formula in Streamlit markdown
@@ -10408,12 +10737,13 @@ def render_chat(opts: Dict[str, Any]):
     # called) so history knows whether a new answer is coming. No st.rerun():
     # the new answer renders in place, which keeps every widget in the page
     # tree current (a rerun left stale buttons whose callbacks could fire).
-    prompt = st.chat_input("Ask about a drug or chemical — e.g. “how does codeine work?”")
+    prompt = st.chat_input("Ask about a drug or chemical")
     pending = st.session_state.pop("chat_pending", None)
     question = cr.clip_query(prompt or pending or "")
 
     if not msgs and not question:
-        with st.chat_message("assistant", avatar="💊"):
+        # In a container so the first question's message replaces it, rather than taking over its contents
+        with st.container(), st.chat_message("assistant", avatar="💊"):
             st.markdown("Hi! Ask me about a medicine or chemical — what it does, how it works, "
                         "side effects, dosing, interactions, structure or properties.")
             render_blocks([_b("buttons", title="Try one — or ask in your own words:",
@@ -10432,6 +10762,10 @@ def render_chat(opts: Dict[str, Any]):
                 st.markdown(_md_safe(m["text"]))
         else:
             with st.chat_message("assistant", avatar="💊"):
+                # Every element stays where it was: the app keeps the last run's elements on screen,
+                # greyed out, until this run ends, so with its buttons gone an answer's last lines
+                # would show twice while the next answer loads
+                st.empty()               # the status line's place
                 # follow-up buttons only on the newest answer, and not while a
                 # new question is being answered below it
                 render_blocks(m["blocks"], f"m{i}",
@@ -10442,12 +10776,13 @@ def render_chat(opts: Dict[str, Any]):
     with st.chat_message("user"):
         st.markdown(_md_safe(question))
     with st.chat_message("assistant", avatar="💊"):
-        t0 = time.perf_counter()
         # a live status line ('Finding “phentermine”…', 'Reading the FDA label,
-        # PubChem…') so a slow first lookup never looks frozen
-        with st.status("Reading your question…", expanded=False) as status:
+        # PubChem…') so a slow first lookup never looks frozen; gone once the
+        # answer is there, whose caption keeps the time
+        working = st.empty()
+        with working.status("Reading your question…", expanded=False) as status:
             reply = chat_respond(question, dict(opts, _progress=lambda m: status.update(label=m)))
-            status.update(label=f"Answered in {time.perf_counter() - t0:.1f} s", state="complete")
+        working.empty()
         msgs.append(reply)
         render_blocks(reply["blocks"], f"m{len(msgs) - 1}", latest=True)
 

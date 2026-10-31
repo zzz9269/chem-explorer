@@ -71,6 +71,29 @@ def test_quote_finds_a_real_indication():
     assert cs.label_use_quote(text, "autistic") == "Treatment of irritability associated with autistic disorder."
 
 
+# REGRESSION: shown as '…lithium or valproate, for the treatment of acute manic or mixed episodes
+# associated with Bipolar I Disorder Treatment of irritability associated with autistic disorder
+# 1.1 Schizophrenia Risperidone tablets are indicated for the treatment of schizophrenia.'
+def test_quote_prefers_the_indications_own_sentence_to_the_opening_list():
+    text = ("1 INDICATIONS AND USAGE Risperidone tablets are an atypical antipsychotic indicated for: Treatment of "
+            "schizophrenia ( 1.1 ) As monotherapy or adjunctive therapy with lithium or valproate, for the treatment "
+            "of acute manic or mixed episodes associated with Bipolar I Disorder ( 1.2 ) Treatment of irritability "
+            "associated with autistic disorder ( 1.3 ) 1.1 Schizophrenia Risperidone tablets are indicated for the "
+            "treatment of schizophrenia. Efficacy was established in 4 short-term trials in adults. 1.3 Irritability "
+            "Associated with Autistic Disorder Risperidone tablets are indicated for the treatment of irritability "
+            "associated with autistic disorder, including symptoms of aggression towards others, deliberate "
+            "self-injuriousness, temper tantrums, and quickly changing moods. Efficacy was established in 3 trials.")
+    quote = cs.label_use_quote(text, "autistic disorder")
+    assert "aggression towards others" in quote and quote.endswith("quickly changing moods.")
+    assert "lithium" not in quote and "Schizophrenia" not in quote and not quote.startswith("1.3")
+
+
+def test_a_label_with_only_the_opening_list_still_gives_a_quote():
+    text = ("INDICATIONS AND USAGE Drug is indicated for: Treatment of pain Treatment of irritability associated "
+            "with autistic disorder 1.1 Pain Drug is indicated for pain.")
+    assert "autistic disorder" in cs.label_use_quote(text, "autistic disorder")
+
+
 # REGRESSION: clomiphene was listed for endometriosis from these sentences
 @pytest.mark.parametrize("text, term", [
     ("Clomiphene is indicated for treatment of ovulatory dysfunction. Endometriosis and Endometrial Carcinoma. "
@@ -78,6 +101,10 @@ def test_quote_finds_a_real_indication():
     ("Indicated for the treatment of pain. Not indicated for the treatment of lupus.", "lupus"),
     ("Treatment of pain. Endometriosis must be excluded before treatment.", "endometriosis"),
     ("The tablets are white and marked on one side with the word lupus.", "lupus"),
+    # phentermine: obesity is its use, and diabetes only one of the risk factors that qualify a patient
+    ("Short-term adjunct in a regimen of weight reduction in patients with an initial body mass index greater "
+     "than 27 in the presence of other risk factors (e.g., controlled hypertension, diabetes, hyperlipidemia).",
+     "diabetes"),
 ])
 def test_quote_rejects_a_mention_that_isnt_a_use(text, term):
     assert cs.label_use_quote(text, term) == ""

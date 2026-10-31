@@ -318,5 +318,22 @@ def availability_text(summary: Dict) -> str:
     return txt
 
 
+def availability_by_route(summary: Dict) -> str:
+    """Where the class varies, the route is often what decides it: 'oral: Pharmacy-only (P);
+    respiratory (inhalation): Prescription-only (POM)' for salbutamol. '' if that doesn't help."""
+    if len((summary or {}).get("classes") or []) < 2:
+        return ""
+    routes: Dict[str, set] = {}
+    for p in summary["products"]:
+        if summary["combination_only"] or len(p["ings"]) == 1:
+            route = (p.get("route") or "").split("&&")[0].strip().lower()
+            if route:
+                routes.setdefault(route, set()).add(p["cls"])
+    if len(routes) < 2:
+        return ""
+    return "; ".join(f"{route}: " + " or ".join(f"{CLASS_LABEL[c]} ({c})" for c in CLASS_ORDER if c in classes)
+                     for route, classes in routes.items())
+
+
 def is_available() -> bool:
     return bool(PRODUCTS)

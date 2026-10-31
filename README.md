@@ -4,17 +4,25 @@ A Streamlit app for looking up medicines and chemicals: uses, dosing, side
 effects, warnings, pharmacology and full chemistry — with every fact tagged by
 its source. Singapore mode adds HSA-registered brands and POM / P / GSL status.
 
-**Ask writes short answers with AI, checked against the sources.** Claude Haiku
-reads the question and the sources below, and every number it states has to be
-in the snippet it cites or the answer isn't shown. Anything not from a source is
-marked as such. If the AI isn't available, can't be verified or the daily limit
-is reached, Ask shows the rule-based answer quoted from the sources. Questions
-asked are sent to Anthropic. Explore, the Drug Library and Reference use no AI.
+**Ask writes short answers with AI, checked against the sources.** Claude Sonnet
+first outlines what a specialist would say, from memory. Claude Haiku then writes
+the answer from that outline and the sources below, and every number it states
+has to be in a source or it isn't shown. A line with no source is marked †, and
+never contains a number. If the AI isn't available, can't be verified or the
+daily limit is reached, Ask shows the rule-based answer quoted from the sources.
+Questions asked are sent to Anthropic. Explore, the Drug Library and Reference
+use no AI.
 
 To turn AI on, add `ANTHROPIC_API_KEY` to the Streamlit secrets (never to a file
 in this folder). Optional secrets `AI_DAILY_LIMIT` (default 200 questions for the
-whole app) and `AI_SESSION_LIMIT` (default 40 per visitor) cap the spend. Without
-a key the app runs exactly as before, with no AI.
+whole app) and `AI_SESSION_LIMIT` (default 40 per visitor) cap the spend. An
+answer costs about S$0.003–0.012. `AI_OUTLINE_MODEL` set to `claude-haiku-5-5`
+saves about S$0.003 a question, but Haiku's outlines have more errors from
+memory. Without a key the app runs exactly as before, with no AI.
+
+HSA's open data doesn't list every registered product (it has no Cymbalta or
+Strattera, though the National Drug Formulary does). A medicine missing from it
+is shown as "Not in HSA's open data", not as unregistered.
 
 > For information only — not medical advice.
 
