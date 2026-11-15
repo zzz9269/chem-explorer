@@ -1,0 +1,72 @@
+# Keeps the Streamlit Community Cloud app from going to sleep.
+#
+# Streamlit puts a free app to sleep after about 12 hours without a visitor, and
+# waking it takes a minute or more. This opens the app in a real browser every
+# 4 hours (a plain HTTP request does not count as a visit), and presses the
+# "Yes, get this app back up!" button if it finds the app asleep.
+#
+# SET THIS UP ONCE: replace the address on the APP_URL line with your app's.
+# Test it from the repository's Actions tab: Keep app awake > Run workflow.
+
+name: Keep app awake
+
+on:
+  schedule:
+    - cron: "17 */4 * * *"   # every 4 hours, at 17 minutes past (UTC)
+  workflow_dispatch:          # lets you run it by hand from the Actions tab
+
+permissions: {}
+
+concurrency:
+  group: keep-awake
+  cancel-in-progress: true
+
+env:
+  APP_URL: "https://chem-explorer-9269fukclu.streamlit.app"
+
+jobs:
+  visit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install a browser
+        run: |
+          pip install --quiet playwright==1.49.1
+          playwright install --with-deps chromium
+
+      - name: Visit the app
+        run: |
+          cat > visit.py <<'EOF'
+          import os, re, sys
+          from playwright.sync_api import sync_playwright
+
+          url = os.environ["APP_URL"]
+          if "YOUR-APP-NAME" in url:
+              sys.exit("Set APP_URL in .github/workflows/keep-awake.yml to your app's address.")
+
+          wake = re.compile("get this app back up", re.I)
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              page = browser.new_page()
+              page.goto(url, wait_until="domcontentloaded", timeout=120_000)
+              page.wait_for_timeout(15_000)          # let the page decide what it is
+              button = page.get_by_role("button", name=wake)
+              if button.count():
+                  print("App was asleep: waking it.")
+                  button.first.click()
+                  # The wake page reloads into the app once the server is up.
+                  button.first.wait_for(state="detached", timeout=300_000)
+                  page.wait_for_timeout(60_000)      # let the app finish starting
+                  if page.get_by_role("button", name=wake).count():
+                      sys.exit("The app is still asleep after pressing the wake button.")
+                  print("App is awake.")
+              else:
+                  print("App was already awake.")
+              page.wait_for_timeout(30_000)          # stay long enough to count as a visit
+              browser.close()
+          EOF
+          python visit.py
