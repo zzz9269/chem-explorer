@@ -77,6 +77,30 @@ QUESTIONS = [
     ("what's the difference between panadol and nurofen", ["paracetamol", "ibuprofen", "anti-?inflam|nsaid"], 110),
     ("drugs that cause high potassium", ["ace inhibitor|lisinopril", "spironolactone|potassium-sparing", "arb|sartan|trimethoprim|nsaid"], 130),
     ("what is serotonin syndrome", ["serotonin", "agitation|tremor|fever|clonus", "ssri|maoi|antidepress"], 100),
+    # chemistry: answered from the structure (RDKit), PubChem's measurements and Wikipedia
+    ("why is phenol more acidic than ethanol", ["resonance|delocalis", "phenoxide|phenolate", r"9\.9|\b10\b"], 120),
+    ("what is the boiling point of ethanol", ["78"], 60),
+    ("what is the pka of ibuprofen", [r"4\.[4-9]|5\.[0-3]", "acid"], 60),
+    ("is ibuprofen chiral", ["yes", "stereocent|chiral cent|enantiomer"], 70),
+    ("which is more lipophilic, propranolol or atenolol", ["propranolol", "logp|log p|lipophil"], 130),
+    ("what is an SN2 reaction", ["nucleophil", "invers|backside", "one step|one-step|concerted|bimolecular"], 110),
+    ("how toxic is methanol", ["formic|formate|formaldehyde", "blind|optic|vision", "995"], 120),
+    ("is sodium hydroxide dangerous", ["corrosive|burn", "eye|skin"], 110),
+    ("what happens if you mix bleach and ammonia", ["chloramine", "toxic|lung|breath"], 110),
+    # research: the literature, registered trials, measured potency
+    ("what is the latest evidence for semaglutide in heart failure", ["step-hfpef|kosiborod", "hfpef|preserved", r"nct\d+|registered"], 230),
+    ("are there clinical trials of psilocybin for depression", [r"nct\d+", "phase 3", "registered|clinicaltrials"], 200),
+    ("is lecanemab effective", ["clarity|van dyck", "aria|amyloid-related", "cdr|modest|small"], 220),
+    ("what are the targets of imatinib and how potent is it", ["abl", "kit", r"\d+ ?nm", "median|measurements"], 150),
+    # sums: done by the app's calculator, never by the model
+    ("how many grams of NaCl do I need for 250 mL of 0.5 M solution", [r"7\.3"], 90),
+    ("what is the pH of 0.01 M HCl", [r"ph 2|= 2|\*\*2"], 90),
+    ("a child weighs 18 kg, what is the dose at 15 mg/kg", ["270"], 90),
+    ("how do I dilute 12 M HCl to make 500 mL of 1 M", [r"41\.7|42"], 110),
+    # depth on request
+    ("tell me everything about the pharmacology of ketamine", ["nmda", "norketamine", "cyp", "esketamine|s-enantiomer", "emergence|bladder"], 300),
+    # legal standing is never said from memory
+    ("is tramadol a controlled drug in singapore", ["prescription", "sources|can't|cannot|not stated|doesn't|don't"], 70),
     # emergencies and refusals
     ("my toddler swallowed 10 panadol", ["995"], 60),
     ("what's the capital of france", [], 30),

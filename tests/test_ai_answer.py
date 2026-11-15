@@ -1262,3 +1262,210 @@ def test_the_key_is_never_in_what_the_page_shows(api):
     api.result = ConnectionError("no route")
     at = _ask_app(NO_LOOKUP_Q)
     assert "test-key-not-real" not in " ".join(str(getattr(e, "value", "")) for e in at.main)
+
+
+# ------------------------------------------------------------------ chemistry questions
+@pytest.mark.parametrize("text", ["1,4-dihydropyridines block calcium channels", "an sp3 carbon", "reacts with Na2CO3",
+                                  "2-(4-isobutylphenyl)propanoic acid", "the C-3 hydroxyl", "a 6-membered ring",
+                                  "chelates Fe2+", "pKa2 is the higher", "an SN2 reaction", "labelled with I-131",
+                                  "a 2° amine", "lowers HbA1c", "gives off CO2 and Cl2"])
+def test_chemical_notation_isnt_a_measure(text):
+    assert ai.claim_ok(text, [], _ev())[0] is True
+
+
+@pytest.mark.parametrize("text", ["a 5-day course", "10-fold higher levels", "500-mg tablets", "a 24-h urine collection",
+                                  "a 65-year-old", "4-hourly", "boils at 78 °C", "a pH of 9"])
+def test_a_count_of_time_or_amount_is_still_a_measure(text):
+    assert ai.claim_ok(text, [], _ev())[0] is False
+
+
+@pytest.mark.parametrize("claim, snippet", [("Boils at 78 °C", "Boiling Point: 78.24 °C"), ("pKa about 10", "pKa = 9.99 at 25 °C"),
+                                            ("cLogP of -1.0", "cLogP -1.029"), ("TPSA about 62", "61.82 Å²")])
+def test_a_long_decimal_may_be_rounded(claim, snippet):
+    assert ai.claim_ok(claim, ["S1"], _ev(snippet))[0] is True
+
+
+@pytest.mark.parametrize("claim, snippet", [("13 mg twice daily", "12.5 mg twice daily"), ("1 mg/kg", "1.4 mg/kg"),
+                                            ("3 mg", "2.5 mg"), ("LD50 of 190 mg/kg", "192 mg/kg"), ("0.2 mg", "0.16 mg")])
+def test_rounding_never_changes_a_dose(claim, snippet):
+    assert ai.claim_ok(claim, ["S1"], _ev(snippet))[0] is False
+
+
+# ------------------------------------------------------------------ where a drug stands in law
+_US_SCHEDULE = "Tramadol hydrochloride tablets contain tramadol, a Schedule IV controlled substance."
+
+
+@pytest.mark.parametrize("text", ["Yes, tramadol is a controlled drug in Singapore.", "It is a Schedule 2 medicine.",
+                                  "Codeine is a Class B drug.", "Listed under the Misuse of Drugs Act."])
+def test_legal_standing_is_never_stated_without_a_source_that_states_it(text):
+    assert ai.claim_ok(text, [], _ev())[0] is False
+    assert ai.claim_ok(text, ["S1"], _ev("Tramadol is an opioid analgesic."))[0] is False
+
+
+def test_legal_standing_a_source_states_can_be_said():
+    assert ai.claim_ok("In the US it is a Schedule IV controlled substance.", ["S1"], _ev(_US_SCHEDULE)) == (True, ["S1"])
+
+
+@pytest.mark.parametrize("text", ["This app's sources don't say whether tramadol is a controlled drug in Singapore.",
+                                  "Whether it is a controlled drug can't be confirmed here."])
+def test_saying_the_sources_dont_settle_it_needs_no_source(text):
+    assert ai.claim_ok(text, [], _ev())[0] is True
+
+
+@pytest.mark.parametrize("text", ["Controlled-release tablets are swallowed whole.", "A Class I antiarrhythmic.",
+                                  "Avoid in Child-Pugh class C.", "Keep to the dosing schedule."])
+def test_other_uses_of_those_words_arent_legal_claims(text):
+    assert ai.claim_ok(text, [], _ev())[0] is True
+
+
+def test_being_asked_to_correct_a_legal_claim_says_so():
+    client = FakeClient(_text(_raw("**Yes, a controlled drug in Singapore.**")), _text(_raw("**Prescription-only.**")))
+    res = _ask(client, prefetched=[{"text": "Tramadol in Singapore: prescription-only.", "src": "HSA register"}])
+    assert res["status"] == "ok" and "where a drug stands in law" in client.requests[1]["messages"][-1]["content"]
+
+
+def test_an_outline_says_which_compounds_and_articles_to_read():
+    plan = {"shape": "explain", "lines": ["x"], "warning": "", "articles": ["A", " ", "B", "C"],
+            "compounds": [{"name": w, "topics": ["chemistry"]} for w in WORDS[:5]] + [{"name": " ", "topics": []}]}
+    out = ai.outline("q", client=OutlineClient(_text(plan)))
+    assert [c["name"] for c in out["compounds"]] == WORDS[:ai.MAX_COMPOUNDS] and out["articles"] == ["A", "B"]
+    assert ai.outline("q", client=OutlineClient(_planned(["x"])))["compounds"] == []      # an older reply without them
+
+
+def test_the_writer_can_be_another_model():
+    client = FakeClient(_text(_raw()))
+    _ask(client, model=ai.OUTLINE_MODEL, prefetched=[{"text": "x", "src": "FDA label"}])
+    assert client.requests[0]["model"] == ai.OUTLINE_MODEL and client.requests[0]["thinking"] == {"type": "between_tools"}
+
+
+@pytest.mark.parametrize("q, fixed", [
+    ("structure of codeine", True), ("draw aspirin", True), ("cas number of aspirin", True), ("properties of ethanol", True),
+    ("ir spectrum of acetone", True),
+    ("why is phenol more acidic than ethanol", False), ("is ibuprofen chiral", False),
+    ("how many stereocentres does atorvastatin have", False), ("what is the boiling point of ethanol", False),
+    ("what is the pka of ibuprofen", False), ("which is more lipophilic, propranolol or atenolol", False),
+    ("what is the molecular formula of glucose", False), ("side effects of metformin", False)])
+def test_a_drawing_or_table_is_kept_for_what_asks_for_one(q, fixed):
+    assert v._ai_drawn_not_written(v.cr.parse_query(q)) is fixed
+
+
+def test_a_chemistry_question_reads_the_compounds_own_record():
+    ents, topics = v._ai_parsed_drugs(v.cr.parse_query("what is the pka of ibuprofen"))
+    assert [e["display"] for e in ents] == ["Ibuprofen"] and topics == ["chemistry"]
+    assert v._ai_parsed_drugs(v.cr.parse_query("which is more lipophilic, propranolol or atenolol"))[1] == ["chemistry"]
+    assert "mechanism" in v._ai_parsed_drugs(v.cr.parse_query("sertraline vs fluoxetine"))[1]
+
+
+def test_a_name_one_letter_from_a_medicines_is_looked_up_as_written(monkeypatch):
+    monkeypatch.setattr(v, "cached_resolve_name", lambda name, cir=True: {"candidates": [{"cid": 887}]})
+    assert v._ai_entity("methanol") == {"kind": "free", "query": "methanol", "display": "methanol"}
+    assert not v._ai_is_medicine(v._ai_entity("methanol"))
+    # and only if nothing goes by that name is it the medicine it resembles
+    monkeypatch.setattr(v, "cached_resolve_name", lambda name, cir=True: {"candidates": []})
+    en = v._ai_entity("metformn")
+    assert en["display"] == "Metformin" and v._ai_is_medicine(en)
+
+
+_IBUPROFEN = {"smiles": "CC(C)Cc1ccc(cc1)C(C)C(=O)O", "formula": "C13H18O2", "cid": 3672, "grouped": {
+    "Experimental Properties & Measurements": {
+        "Boiling Point": "315 °F at 4 mmHg | [157] | 157 °C at 4 mmHg", "Dissociation Constants": "pKa = 4.91",
+        "Solubility": "21 mg/L at 25 °C"}}}
+
+
+def test_the_structure_says_what_can_be_counted_and_what_is_only_inferred():
+    out = v._ai_chem_snippets(_IBUPROFEN, "Ibuprofen")
+    by_src = {src: " ".join(s["text"] for s in out if s["src"] == src) for src in {s["src"] for s in out}}
+    assert "C13H18O2" in by_src["RDKit (computed)"] and "1 stereocentre " in by_src["RDKit (computed)"]
+    assert "carboxylic acid" in by_src["inferred from structure"] and "not a measurement" in by_src["inferred from structure"]
+    assert "pKa = 4.91" in by_src["PubChem"]
+    # measured, so the rule of thumb about solubility isn't offered beside it
+    assert "Expected water solubility" not in by_src["inferred from structure"]
+    assert all(s["url"].endswith("/3672") for s in out)
+
+
+def test_the_property_asked_about_comes_first_and_in_celsius():
+    measured = v._ai_measured_snippets(_IBUPROFEN, "Ibuprofen", "what is the boiling point of ibuprofen")
+    assert [s["text"] for s in measured[:3]] == ["Ibuprofen, measured. Boiling Point: 157 °C at 4 mmHg",
+                                                 "Ibuprofen, measured. Boiling Point: 315 °F at 4 mmHg",
+                                                 "Ibuprofen, measured. Boiling Point: [157]"]
+    assert len([s for s in measured if "Dissociation" in s["text"]]) == 1
+
+
+def test_a_biologic_has_no_structure_to_calculate_from():
+    out = v._ai_chem_snippets({"smiles": "", "grouped": {}}, "Adalimumab")
+    assert len(out) == 1 and "no small-molecule structure" in out[0]["text"]
+
+
+def test_a_chemicals_dangers_are_read_from_its_hazard_sections():
+    docs = [dict(_doc("Causes severe skin burns and eye damage.", "PubChem"), topic="hazard"),
+            dict(_doc("Boiling Point: 1388 °C", "PubChem"), topic="properties")]
+    read = lambda ctx, topics: [s["text"] for s in v._ai_corpus_snippets(ctx, "X", topics, [])]   # noqa: E731
+    assert read({"_corpus": docs}, ["hazards"]) == ["Causes severe skin burns and eye damage."]
+    assert read({"_corpus": docs}, ["warnings"]) == ["Causes severe skin burns and eye damage."]
+    assert read({"_corpus": docs}, ["chemistry"]) == ["Boiling Point: 1388 °C"]
+    # a medicine's warnings are its label's, not the hazard codes of the raw chemical
+    assert read({"_corpus": docs, "label": {"url": "x"}}, ["warnings"]) == []
+
+
+def _subject_loads(monkeypatch, slow=()):
+    state = _no_load(monkeypatch, slow)
+    monkeypatch.setattr(v, "_ai_entity", lambda name: {"kind": "library", "query": name.lower(), "display": name})
+    monkeypatch.setattr(v, "_ai_loads", lambda en, opts, topics, *a: state.loads.append((en["query"], tuple(topics)))
+                        or (en["query"] in slow and state.release.wait(5)) or ({"ctx": {}, "query": en["query"]}, None))
+    return state
+
+
+def test_what_the_outline_says_the_question_is_about_is_read(monkeypatch):
+    state = _subject_loads(monkeypatch)
+    loads = v._AiSubjectLoads({"region": "SG", "_ai_articles": []})
+    loads.want({"lines": ["x"], "compounds": [{"name": "Methanol", "topics": ["hazards", "chemistry"]}],
+                "articles": ["Methanol toxicity"]}, {})
+    out = loads.read(time.monotonic() + 5)
+    assert state.loads == [("methanol", ("hazards", "chemistry"))]
+    assert [s["text"] for s in out] == ["About Methanol", "Article on Methanol toxicity"]
+
+
+def test_what_the_parser_is_already_reading_isnt_read_twice(monkeypatch):
+    state = _subject_loads(monkeypatch)
+    loads = v._AiSubjectLoads({"region": "SG", "_ai_articles": []})
+    loads.want({"lines": ["x"], "articles": [], "compounds": [{"name": "Ibuprofen", "topics": ["pk", "chemistry"]},
+                                                              {"name": "Warfarin", "topics": ["pk"]}]},
+               {"ibuprofen": {"pk", "interactions"}, "warfarin": {"pk"}})
+    loads.read(time.monotonic() + 5)
+    assert state.loads == [("ibuprofen", ("chemistry",))]
+
+
+def test_a_compound_still_coming_at_the_deadline_is_left_out(monkeypatch):
+    state = _subject_loads(monkeypatch, slow=("methanol",))
+    loads = v._AiSubjectLoads({"region": "SG", "_ai_articles": []})
+    loads.want({"lines": ["x"], "articles": [], "compounds": [{"name": "Methanol", "topics": ["hazards"]},
+                                                              {"name": "Ethanol", "topics": ["hazards"]}]}, {})
+    out = loads.read(time.monotonic() + 0.5)
+    state.release.set()
+    assert [s["text"] for s in out] == ["About Ethanol"]
+
+
+def test_the_outlines_compounds_are_asked_for_as_soon_as_it_is_back(monkeypatch):
+    plan = {"shape": "explain", "lines": ["x"], "warning": "", "compounds": [{"name": "phenol", "topics": ["chemistry"]}], "articles": []}
+    monkeypatch.setattr(ai, "outline", lambda question, **kw: plan)
+    wanted = []
+    parsed = v.cr.parse_query("what is the pka of ibuprofen")
+    v._ai_outline_then_labels("q", None, [], parsed, NS(want=lambda *a, **k: None), {"region": "SG", "_ai_usage": {}},
+                              NS(want=lambda plan, covered: wanted.append(covered)))
+    assert wanted == [{"ibuprofen": {"chemistry"}}]
+
+
+def test_singapore_legal_status_comes_with_what_the_app_cant_look_up(monkeypatch):
+    monkeypatch.setattr(v, "_ai_load", lambda *a, **k: {"ctx": {"drug_hit": {"name": "Tramadol"}, "_corpus": []}, "query": "tramadol"})
+    out = v._ai_drug_tool({"drug": "Tramadol", "topics": ["legal"]}, {"region": "SG"})
+    assert [s["section"] for s in out] == ["Availability", "Tramadol · Legal status"]
+    assert "Misuse of Drugs Act" in out[1]["text"] and "POM" in out[0]["text"] + out[1]["text"]
+    assert v._ai_drug_tool({"drug": "Tramadol", "topics": ["legal"]}, {"region": "US"}) == []
+
+
+def test_an_answer_about_structure_comes_with_the_drawing(api):
+    api.result = _ok()
+    seen = [({"kind": "library", "display": "Ibuprofen"}, {"smiles": _IBUPROFEN["smiles"]}, "ibuprofen"),
+            ({"kind": "library", "display": "Ibuprofen"}, {"smiles": ""}, "ibuprofen")]
+    blocks = v._ai_drawings({"_ai_seen": seen})
+    assert [b["t"] for b in blocks] == ["image"] and blocks[0]["caption"] == "Ibuprofen" and blocks[0]["v"][:4] == b"\x89PNG"

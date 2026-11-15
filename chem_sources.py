@@ -225,11 +225,14 @@ def _pace(host: str):
         time.sleep(slot - now)
 
 
-def _get(url: str, timeout: int = PUG_TIMEOUT) -> Optional[requests.Response]:
-    host = _host_of(url)
+def _get(url: str, timeout: int = PUG_TIMEOUT, breaker: str = "") -> Optional[requests.Response]:
+    """`breaker`: a name to count this service's failures under instead of its host's. EBI serves
+    ChEMBL, UniChem and Europe PMC from one host, and a slow ChEMBL query must not switch off
+    the literature search for two minutes."""
+    host = breaker or _host_of(url)
     if host_degraded(host):
         return None
-    _pace(host)
+    _pace(_host_of(url))
     _count()
     try:
         r = get_session().get(url, timeout=timeout)
@@ -1627,3 +1630,308 @@ def guidetopharmacology_by_inchikey(inchikey: str,
         "url": f"https://www.guidetopharmacology.org/GRAC/LigandDisplayForward?ligandId={lig_id}",
         "interactions": rows,
     }
+
+
+# ---------------------------------------------------------------------------
+# Research sources: published literature, registered trials, measured potency
+# ---------------------------------------------------------------------------
+# Europe PMC indexes every PubMed record and answers in one request with the
+# abstract and a citation count (PubMed's own API needs two and has neither a
+# count nor JSON abstracts). Free, no key.
+EUROPEPMC_SEARCH = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+# ClinicalTrials.gov API v2 (US National Library of Medicine). Free, no key.
+CTGOV_STUDIES = "https://clinicaltrials.gov/api/v2/studies"
+
+_EVIDENCE_TYPES = ("Randomized Controlled Trial", "Meta-Analysis", "Systematic Review",
+                   "Practice Guideline", "Guideline", "Review")
+_EVIDENCE_FILTER = "(" + " OR ".join(f'PUB_TYPE:"{t}"' for t in _EVIDENCE_TYPES) + ")"
+# What kind of paper it is, strongest first: the label a reader weighs a finding by
+_PAPER_KINDS = (("Practice Guideline", "guideline"), ("Guideline", "guideline"),
+                ("Meta-Analysis", "meta-analysis"), ("Network Meta-Analysis", "meta-analysis"),
+                ("Systematic Review", "systematic review"),
+                ("Randomized Controlled Trial", "randomised trial"),
+                ("Clinical Trial, Phase III", "phase 3 trial"), ("Clinical Trial, Phase II", "phase 2 trial"),
+                ("Clinical Trial, Phase I", "phase 1 trial"), ("Clinical Trial", "clinical trial"),
+                ("Observational Study", "observational study"), ("Case Reports", "case report"),
+                ("Review", "review"), ("Letter", "letter"), ("Editorial", "editorial"))
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _plain(text: Any) -> str:
+    """Europe PMC titles and abstracts carry markup, sometimes escaped twice
+    ('BCL-X&lt;sub&gt;L&lt;/sub&gt;')."""
+    import html as _html_mod
+    s = _html_mod.unescape(_html_mod.unescape(str(text or "")))
+    # A structured abstract's headings are tags: without this, 'BackgroundThe accumulation…'
+    s = re.sub(r"\s*</h\d>\s*", ": ", s)
+    s = re.sub(r"<(?:/?p|br\s*/?|h\d)>", " ", s)
+    return re.sub(r"\s+", " ", _TAG_RE.sub("", s)).strip()
+
+
+def _paper(x: Dict[str, Any]) -> Dict[str, Any]:
+    types = [t for t in ((x.get("pubTypeList") or {}).get("pubType") or []) if isinstance(t, str)]
+    kind = next((label for name, label in _PAPER_KINDS if name in types), "")
+    authors = _plain(x.get("authorString")).rstrip(".")
+    names = [a.strip() for a in authors.split(",") if a.strip()]
+    first = re.sub(r"\s+[A-Z]{1,3}$", "", names[0]) if names else ""        # 'Kosiborod MN' → 'Kosiborod'
+    journal = ((x.get("journalInfo") or {}).get("journal") or {})
+    pmid = str(x.get("pmid") or "")
+    try:
+        cited = int(x.get("citedByCount") or 0)
+    except (TypeError, ValueError):
+        cited = 0
+    return {"pmid": pmid, "doi": x.get("doi") or "", "title": _plain(x.get("title")).rstrip("."),
+            "first_author": first, "et_al": len(names) > 1, "authors": authors,
+            "journal": _plain(journal.get("isoabbreviation") or journal.get("title")),
+            "year": str(x.get("pubYear") or ""), "cited": cited, "kind": kind, "types": types,
+            "abstract": _plain(x.get("abstractText")), "open_access": x.get("isOpenAccess") == "Y",
+            "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else ""}
+
+
+def _epmc(query: str, sort: str, size: int) -> Optional[List[Dict[str, Any]]]:
+    """One Europe PMC search → papers, or None when the service didn't answer."""
+    q = f"{query} AND SRC:MED AND HAS_ABSTRACT:y"
+    url = (f"{EUROPEPMC_SEARCH}?query={_urlquote(q, safe='')}&format=json&resultType=core"
+           f"&pageSize={int(size)}" + (f"&sort={_urlquote(sort, safe='')}" if sort else ""))
+    r = _get(url, timeout=10, breaker="europepmc")
+    if r is None or r.status_code != 200:
+        return None
+    try:
+        rows = ((r.json().get("resultList") or {}).get("result") or [])
+    except Exception:
+        return None
+    return [p for p in (_paper(x) for x in rows) if p["pmid"] and p["title"]]
+
+
+# Words that say what kind of paper is wanted, not what it is about. Required in a title they
+# throw out the landmark trial ('Trial of Psilocybin versus Escitalopram' has no 'randomized')
+_LIT_GENERIC_RE = re.compile(r"\b(?:randomi[sz]ed|controlled|clinical|trials?|stud(?:y|ies)|reviews?|systematic|"
+                             r"meta-?analys[ei]s|guidelines?|evidence|efficacy|safety|effects?|latest|recent|new|"
+                             r"research|outcomes?|treatment|therapy|use|human|patients?)\b", re.I)
+
+
+def _lit_terms(terms) -> List[str]:
+    out = []
+    for t in terms or ():
+        t = re.sub(r'["()\[\]{}:\\]', " ", str(t or ""))
+        t = re.sub(r"\s+", " ", _LIT_GENERIC_RE.sub(" ", t)).strip(" -,")
+        if len(t) >= 2 and t.lower() not in {x.lower() for x in out}:
+            out.append(t)
+    return out[:4]
+
+
+def literature_search(terms: Tuple[str, ...], most_cited: int = 4, newest: int = 3) -> Dict[str, Any]:
+    """Published papers on a topic, from PubMed's records by way of Europe PMC.
+
+    `terms` are 1-4 key words or phrases ('semaglutide', 'heart failure'). Two
+    searches run side by side over papers with every term in the TITLE (a term
+    anywhere in the text drifts off topic at once: 'semaglutide heart failure'
+    by citations gives a heart-disease statistics report):
+      * the most cited — the landmark trials and guidelines, and
+      * the newest trials, meta-analyses, reviews and guidelines.
+    If the title search finds too little, the first term stays in the title and
+    the rest may be in the abstract.
+
+    → {"papers": [{pmid, title, first_author, journal, year, cited, kind,
+       abstract, url, why: "most cited" | "recent"}], "query": terms, "ok": bool}
+    `ok` is False when Europe PMC didn't answer (an outage, not 'no papers')."""
+    terms = _lit_terms(terms)
+    if not terms:
+        return {"papers": [], "query": [], "ok": True}
+    title = "(" + " AND ".join(f'TITLE:"{t}"' for t in terms) + ")"
+    ex = ThreadPoolExecutor(max_workers=2)
+    try:
+        f_cited = ex.submit(_epmc, title, "CITED desc", most_cited + 2)
+        f_new = ex.submit(_epmc, f"{title} AND {_EVIDENCE_FILTER}", "P_PDATE_D desc", newest + 4)
+        cited, new = f_cited.result(), f_new.result()
+    finally:
+        ex.shutdown(wait=False)
+    ok = cited is not None or new is not None
+    cited, new = cited or [], new or []
+    if len(cited) < 3 and len(terms) > 2 and ok:
+        # three words is often one too many for a title: the subject and its topic are the first two
+        two = "(" + " AND ".join(f'TITLE:"{t}"' for t in terms[:2]) + ")"
+        more = _epmc(two, "CITED desc", most_cited + 2) or []
+        cited += [p for p in more if p["pmid"] not in {c["pmid"] for c in cited}]
+        if len(new) < 2:
+            newer = _epmc(f"{two} AND {_EVIDENCE_FILTER}", "P_PDATE_D desc", newest + 4) or []
+            new += [p for p in newer if p["pmid"] not in {c["pmid"] for c in new}]
+    if len(cited) < 3 and len(terms) > 1 and ok:
+        loose = "(" + " AND ".join([f'TITLE:"{terms[0]}"'] + [f'(TITLE:"{t}" OR ABSTRACT:"{t}")' for t in terms[1:]]) + ")"
+        more = _epmc(loose, "CITED desc", most_cited + 2) or []
+        cited += [p for p in more if p["pmid"] not in {c["pmid"] for c in cited}]
+    papers: List[Dict[str, Any]] = []
+    seen: set = set()
+    for pool, why, n in ((cited, "most cited", most_cited), (new, "recent", newest)):
+        kept = 0
+        for p in pool:
+            # A paper nobody has cited isn't a landmark, whatever the sort says
+            if kept >= n or p["pmid"] in seen or (why == "most cited" and p["cited"] < 1 and papers):
+                continue
+            seen.add(p["pmid"])
+            papers.append(dict(p, why=why))
+            kept += 1
+    return {"papers": papers, "query": terms, "ok": ok}
+
+
+def _ct_date(struct: Any) -> str:
+    return str((struct or {}).get("date") or "")[:7]          # '2024-08'
+
+
+_CT_PHASE = {"EARLY_PHASE1": "early phase 1", "PHASE1": "phase 1", "PHASE2": "phase 2",
+             "PHASE3": "phase 3", "PHASE4": "phase 4", "NA": ""}
+_CT_PHASE_RANK = {"PHASE4": 4, "PHASE3": 3, "PHASE2": 2, "PHASE1": 1, "EARLY_PHASE1": 0}
+
+
+def clinical_trials(condition: str = "", intervention: str = "", limit: int = 8) -> Dict[str, Any]:
+    """Registered studies from ClinicalTrials.gov for a condition and/or an
+    intervention (either may be empty, not both).
+
+    → {"total": how many the registry lists, "trials": [{nct, title, status,
+       phase, enrollment, sponsor, start, completion, outcome, has_results,
+       type, url}], "by_status": {status: n} over the ones read, "read": n,
+       "ok": bool}
+    The registry's own order is by relevance; here the later phases and larger
+    studies come first, withdrawn and terminated ones last."""
+    condition, intervention = (condition or "").strip(), (intervention or "").strip()
+    if not condition and not intervention:
+        return {"total": 0, "trials": [], "by_status": {}, "read": 0, "ok": True}
+    fields = ("NCTId,BriefTitle,OverallStatus,Phase,EnrollmentCount,LeadSponsorName,StartDate,"
+              "PrimaryCompletionDate,PrimaryOutcomeMeasure,HasResults,StudyType")
+    url = f"{CTGOV_STUDIES}?pageSize=40&countTotal=true&fields={_urlquote(fields, safe=',')}"
+    if condition:
+        url += f"&query.cond={_urlquote(condition, safe='')}"
+    if intervention:
+        url += f"&query.intr={_urlquote(intervention, safe='')}"
+    r = _get(url, timeout=10)
+    if r is None or r.status_code != 200:
+        return {"total": 0, "trials": [], "by_status": {}, "read": 0, "ok": False}
+    try:
+        j = r.json()
+    except Exception:
+        return {"total": 0, "trials": [], "by_status": {}, "read": 0, "ok": False}
+    trials, by_status = [], {}
+    for s in j.get("studies") or []:
+        ps = s.get("protocolSection") or {}
+        ident, status = ps.get("identificationModule") or {}, ps.get("statusModule") or {}
+        design = ps.get("designModule") or {}
+        nct = ident.get("nctId") or ""
+        if not nct:
+            continue
+        phases = design.get("phases") or []
+        state = str(status.get("overallStatus") or "").replace("_", " ").lower()
+        by_status[state] = by_status.get(state, 0) + 1
+        outcomes = (ps.get("outcomesModule") or {}).get("primaryOutcomes") or []
+        trials.append({
+            "nct": nct, "title": re.sub(r"\s+", " ", ident.get("briefTitle") or "").strip(),
+            "status": state,
+            "phase": "/".join(p for p in (_CT_PHASE.get(x, x.lower()) for x in phases) if p),
+            "_rank": max((_CT_PHASE_RANK.get(x, -1) for x in phases), default=-1),
+            "enrollment": (design.get("enrollmentInfo") or {}).get("count"),
+            "sponsor": ((ps.get("sponsorCollaboratorsModule") or {}).get("leadSponsor") or {}).get("name") or "",
+            "start": _ct_date(status.get("startDateStruct")),
+            "completion": _ct_date(status.get("primaryCompletionDateStruct")),
+            "outcome": re.sub(r"\s+", " ", (outcomes[0].get("measure") if outcomes else "") or "").strip(),
+            "has_results": bool(s.get("hasResults")),
+            "type": str(design.get("studyType") or "").lower(),
+            "url": f"https://clinicaltrials.gov/study/{nct}"})
+    read = len(trials)
+    # The later phases and the larger studies first: those are what a field's evidence will rest on
+    live = ("completed", "recruiting", "active not recruiting", "enrolling by invitation", "not yet recruiting")
+    order = sorted(range(read), key=lambda i: (trials[i]["status"] not in live, -trials[i]["_rank"],
+                                               -(trials[i]["enrollment"] or 0), not trials[i]["has_results"], i))
+    picked = [{k: v for k, v in trials[i].items() if k != "_rank"} for i in order[:max(1, limit)]]
+    try:
+        total = int(j.get("totalCount") or read)
+    except (TypeError, ValueError):
+        total = read
+    return {"total": total, "trials": picked, "by_status": by_status, "read": read, "ok": True}
+
+
+_POTENCY_TYPES = ("IC50", "Ki", "Kd", "EC50")
+
+
+def _median(values: List[float]) -> float:
+    v = sorted(values)
+    mid = len(v) // 2
+    return v[mid] if len(v) % 2 else (v[mid - 1] + v[mid]) / 2
+
+
+def _nm_text(nm: float) -> str:
+    """A concentration in the unit a pharmacologist would say it in, to 2 significant figures."""
+    for unit, size in (("mM", 1e6), ("µM", 1e3), ("nM", 1.0), ("pM", 1e-3)):
+        if nm >= size or unit == "pM":
+            return f"{float(f'{nm / size:.2g}'):g} {unit}"
+    return f"{nm:g} nM"
+
+
+def chembl_potency(name: str = "", chembl_id: str = "", max_targets: int = 8) -> Dict[str, Any]:
+    """How potent a compound is at each human protein target: the median of
+    ChEMBL's curated binding measurements (IC50, Ki, Kd, EC50) per target, with
+    how many measurements it summarises and their range.
+
+    A single published IC50 depends on its assay, and a well-studied drug has
+    dozens that differ tenfold; the median over all of them, with the count, is
+    the fair figure. Measured values only — nothing predicted.
+
+    → {"chembl_id", "name", "url", "targets": [{target, type, median_nm, text,
+       n, low_text, high_text}], "ok": bool}; {} when ChEMBL has no such compound."""
+    cid = (chembl_id or "").strip().upper()
+    shown = (name or "").strip()
+    if not cid:
+        if not shown:
+            return {}
+        r = _get(f"{CHEMBL_BASE}/molecule.json?pref_name__iexact={_urlquote(shown, safe='')}"
+                 "&only=molecule_chembl_id,pref_name&limit=1", timeout=10, breaker="chembl-potency")
+        if r is None or r.status_code != 200:
+            return {"ok": False, "targets": []}
+        try:
+            mols = r.json().get("molecules") or []
+        except Exception:
+            return {"ok": False, "targets": []}
+        if not mols:
+            # a synonym or a salt's name: the search endpoint knows those
+            cands = chembl_molecule_by_name(shown, limit=3)
+            cid = next((c["chembl_id"] for c in cands if c["chembl_id"]
+                        and shown.lower() in (c.get("pref_name") or "").lower()), "")
+            if not cid:
+                return {}
+        else:
+            cid = mols[0].get("molecule_chembl_id") or ""
+    r = _get(f"{CHEMBL_BASE}/activity.json?molecule_chembl_id={cid}&pchembl_value__isnull=false"
+             f"&assay_type=B&target_organism=Homo%20sapiens&standard_type__in={','.join(_POTENCY_TYPES)}"
+             "&limit=1000&only=target_pref_name,target_chembl_id,standard_type,pchembl_value", timeout=15,
+             breaker="chembl-potency")
+    if r is None or r.status_code != 200:
+        return {"ok": False, "targets": [], "chembl_id": cid}
+    try:
+        acts = r.json().get("activities") or []
+    except Exception:
+        return {"ok": False, "targets": [], "chembl_id": cid}
+    groups: Dict[Tuple[str, str], List[float]] = {}
+    for a in acts:
+        try:
+            p = float(a.get("pchembl_value"))
+        except (TypeError, ValueError):
+            continue
+        target = (a.get("target_pref_name") or "").strip()
+        if target and target.lower() not in ("unchecked", "no relevant target") and a.get("standard_type") in _POTENCY_TYPES:
+            groups.setdefault((target, a["standard_type"]), []).append(p)
+    # One row per target: the kind of measurement it has most of
+    best: Dict[str, Tuple[str, List[float]]] = {}
+    for (target, kind), vals in groups.items():
+        if target not in best or len(vals) > len(best[target][1]):
+            best[target] = (kind, vals)
+    rows = []
+    for target, (kind, vals) in best.items():
+        med = _median(vals)
+        rows.append({"target": target, "type": kind, "n": len(vals), "pchembl": round(med, 2),
+                     "median_nm": 10 ** (9 - med), "text": _nm_text(10 ** (9 - med)),
+                     "low_text": _nm_text(10 ** (9 - max(vals))), "high_text": _nm_text(10 ** (9 - min(vals)))})
+    # The most measured targets first: those are the ones the compound is studied for (imatinib:
+    # ABL1, BCR-ABL, KIT), where the most potent would lead with whatever a kinase panel turned up
+    solid = [x for x in rows if x["n"] >= 2] or rows
+    solid.sort(key=lambda x: (-x["n"], -x["pchembl"]))
+    return {"chembl_id": cid, "name": shown, "ok": True, "measurements": len(acts),
+            "url": f"https://www.ebi.ac.uk/chembl/compound_report_card/{cid}/",
+            "targets": solid[:max(1, max_targets)]}

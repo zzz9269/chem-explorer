@@ -13,12 +13,55 @@ daily limit is reached, Ask shows the rule-based answer quoted from the sources.
 Questions asked are sent to Anthropic. Explore, the Drug Library and Reference
 use no AI.
 
+**Chemistry questions get the same treatment.** *Why is phenol more acidic than
+ethanol?*, *is ibuprofen chiral?*, *boiling point of ethanol*, *what happens if
+you mix bleach and ammonia?*, *what is an SN2 reaction?* are answered from what
+RDKit computes from the structure (formula, stereocentres, functional groups,
+acid and base centres), PubChem's measured properties and hazard sections, and
+Wikipedia. A value is labelled as measured, calculated or inferred, and the
+structure is drawn under an answer about structure. Plain look-ups (*structure
+of codeine*, *CAS number of aspirin*, *properties of ethanol*) still show the
+app's own drawing or table, with no AI.
+
+**Research questions are answered from the literature.** *What is the latest
+evidence for semaglutide in heart failure?*, *are there clinical trials of
+psilocybin for depression?*, *is lecanemab effective?* search **PubMed** (through
+Europe PMC) for the most cited papers and the newest trials, meta-analyses and
+guidelines on the topic, and **ClinicalTrials.gov** for registered studies. The
+answer names each study, gives the figures from its abstract and links it, and a
+📚 Reading list under the answer has every paper and trial found. *What are the
+targets of imatinib and how potent is it?* is answered from **ChEMBL**: the median
+of the published IC50 / Ki / Kd measurements at each human target, with how many
+measurements that is and their range. The 🔬 Research tab in Explore shows the
+same three sources for any compound, with no AI.
+
+**Sums are done by a calculator, not by the AI.** *How many grams of NaCl for
+250 mL of 0.5 M?*, *pH of 0.01 M HCl*, *dilute 12 M HCl to 500 mL of 1 M*, *15
+mg/kg for an 18 kg child*: the model writes the expression, the app evaluates it
+(molar masses from standard atomic weights, hydrates included) and the answer may
+only state a figure the calculator produced. If the model put in a value the
+question didn't give, the working says so.
+
+**Answer length.** Standard answers are short. *Detailed* (sidebar), ending a
+question with *in detail*, or **➕ More detail** under an answer gives about twice
+as many points. **⬇️ Save conversation** in the sidebar downloads every question,
+answer, source and link as a Markdown file.
+
+Two things an answer never takes from the AI's memory: a **number** (a long
+decimal may be rounded, 78.24 °C to 78 °C, but 12.5 mg is never 13 mg), and a
+drug's **standing in law** (controlled drug, schedule, class). The HSA register
+gives POM / P / GSL; it doesn't hold the Misuse of Drugs Act schedules, and the
+answer says so rather than guess.
+
 To turn AI on, add `ANTHROPIC_API_KEY` to the Streamlit secrets (never to a file
 in this folder). Optional secrets `AI_DAILY_LIMIT` (default 200 questions for the
 whole app) and `AI_SESSION_LIMIT` (default 40 per visitor) cap the spend. An
-answer costs about S$0.003–0.012. `AI_OUTLINE_MODEL` set to `claude-haiku-5-5`
+answer costs about S$0.003–0.012 (a detailed or literature answer up to about
+S$0.03). `AI_OUTLINE_MODEL` set to `claude-haiku-5-5`
 saves about S$0.003 a question, but Haiku's outlines have more errors from
-memory. Without a key the app runs exactly as before, with no AI.
+memory. `AI_WRITER_MODEL` set to `claude-sonnet-5-5` has the stronger model write
+the answer as well, at roughly ten times the cost of a question. Without a key
+the app runs exactly as before, with no AI.
 
 HSA's open data doesn't list every registered product (it has no Cymbalta or
 Strattera, though the National Drug Formulary does). A medicine missing from it
@@ -34,6 +77,9 @@ is shown as "Not in HSA's open data", not as unregistered.
 | **Singapore status** from the HSA register: local brands, POM / P / GSL per product | Often gives US or outdated availability |
 | Every sentence links to its source; "not stated" when the sources are silent | Rarely shows where a claim came from |
 | Chemistry computed from the structure (RDKit): formula, stereocentres, drug-likeness, acid/base centres and charge at pH 7.4 | Recalls or approximates |
+| **Trial results from the paper's own abstract**, each linked to PubMed, plus what is registered on ClinicalTrials.gov today | Recalls studies from training data; can misquote a figure or invent a reference |
+| **Potency as the median of every published measurement** (ChEMBL), with the count and range | Quotes one remembered IC50 |
+| **Arithmetic by a calculator**, with the working shown | Does sums in its head |
 | Your own *Mainstream Drug Reference*, side by side with the official sources | — |
 | Free, no account | — |
 
@@ -42,6 +88,12 @@ specific patient. This app is the place to get a short answer you can **check**
 against what the sources actually say.
 
 ## How Ask understands questions
+
+With AI on, the outline model also says which compounds and Wikipedia articles a
+question is about, and the app reads those: the parser only matches names it
+knows, so *methanol* (one letter from a medicine), *bleach* or *is caffeine
+polar* were beyond it. A name close to a medicine's is always looked up as typed
+before it is treated as a misspelling.
 
 The parser (`chat_router.py`) recognises these question shapes:
 
@@ -89,6 +141,9 @@ python -m pytest -m "not slow"      # + live label/name checks
 python -m pytest                    # everything incl. whole-app checks
 ```
 
+* `tests/test_research.py` — the calculator (what it computes and what it refuses),
+  detailed answers, answers about the evidence, and how papers, trials and
+  potency figures become citable snippets.
 * `tests/test_reasoning_gaps.py` — question shapes the parser used to get wrong
   (two drugs at once, classes, concepts, why-questions, several questions).
 * `tests/test_answer_quality.py` (slow) — runs the app on live sources and
@@ -110,6 +165,9 @@ don't run them in a tight loop.
 | RxNorm / RxClass (NLM) | US brands, drug classes | free NLM terms of service |
 | HSA Listing of Registered Therapeutic Products (data.gov.sg) | Singapore brands & availability | Singapore Open Data Licence v1.0 |
 | Wikipedia | plain-language summaries, drug-class & concept articles | CC BY-SA 4.0 |
+| Europe PMC (PubMed records) | papers: titles, abstracts, citation counts | abstracts © their publishers; metadata free to reuse |
+| ClinicalTrials.gov (NLM) | registered studies: phase, status, size, sponsor | public domain |
+| ChEMBL activities (EMBL-EBI) | potency at each target (IC50, Ki, Kd, EC50) | CC BY-SA 3.0 |
 | Wikidata, UniChem, OPSIN, NCI CIR | identifiers, cross-references, name → structure | CC0 / open services |
 
 Refresh the bundled snapshots with `python build_hsa_register.py` and
