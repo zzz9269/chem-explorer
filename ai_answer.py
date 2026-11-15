@@ -255,6 +255,20 @@ trials: {"condition", "intervention"} to search ClinicalTrials.gov with, either 
 calculations: for shape calculate, the arithmetic, at most 5 steps in order. name: a short variable name later steps may use (n, mass). label: what the result is ("mass of NaCl needed"). expression: numbers, + - * / ** and brackets; log10, ln, exp, sqrt, abs, round, min, max; pi, R, NA, F, kB; and M('NaCl') for a molar mass in g/mol, with hydrates as M('CuSO4.5H2O'). unit: the result's unit ("g", "mol/L", "" for pH). Convert units inside the expression (250 mL as 0.25 for litres). Use only numbers the question gives, molar masses through M() and those constants: if it needs a measured value the question doesn't give (a pKa, a density), name the compound in compounds with topic chemistry and leave that step out, and the answer will be written from its record. Empty for every other shape."""
 
 
+# The app's Medical assistant page: a consultation, where the Ask page takes one question at a time
+MEDICAL_NOTE = ("\n\nMEDICAL ASSISTANT MODE. The reader is consulting you as they would a general practitioner, and the "
+                "earlier messages are the consultation so far. Anything they say about how they feel or what has "
+                "happened to their body is shape symptoms, including a short reply to a question you asked "
+                "(\"3 days, no fever\"): then assess again with everything they have told you so far, say what "
+                "the new detail changes, and don't ask again for anything they have already answered. Recommend the "
+                "best course of action as a GP would: what to do themselves, which non-prescription medicine fits, "
+                "and whether this needs a pharmacist, a GP appointment, an urgent same-day visit or an ambulance. "
+                "Take account of anything they mention about their age, pregnancy, other conditions or regular "
+                "medicines. A possible emergency is still shape emergency, and a direct question about a medicine, a "
+                "dose or a condition keeps its own shape. You cannot examine the reader or order tests: a probable "
+                "cause, never a diagnosis.")
+
+
 def _detail_note(detail: bool, what: str) -> str:
     if not detail:
         return ""
@@ -269,7 +283,7 @@ def _detail_note(detail: bool, what: str) -> str:
 
 def outline(question: str, *, client: Any, region: str = "SG", history: Sequence[Tuple[str, str]] = (),
             usage: Optional[Dict[str, Any]] = None, model: str = OUTLINE_MODEL,
-            detail: bool = False) -> Optional[Dict[str, Any]]:
+            detail: bool = False, medical: bool = False) -> Optional[Dict[str, Any]]:
     """What a specialist would say, from the model's own knowledge and before it sees any
     evidence: shown the evidence first, it only rewords that and misses what it doesn't
     mention. Runs beside the evidence look-up, so it adds little wait. → {"shape", "lines"},
@@ -280,7 +294,7 @@ def outline(question: str, *, client: Any, region: str = "SG", history: Sequence
         messages += [{"role": "user", "content": q}, {"role": "assistant", "content": a or "(answered)"}]
     messages.append({"role": "user", "content": question})
     system = OUTLINE_SYSTEM + ("\n\nThe reader is in Singapore: use Singapore names (paracetamol, salbutamol)."
-                               if region == "SG" else "") + _detail_note(detail, "lines")
+                               if region == "SG" else "") + _detail_note(detail, "lines") + (MEDICAL_NOTE if medical else "")
     try:
         resp = client.with_options(timeout=OUTLINE_TIMEOUT_S, max_retries=0).messages.create(
             model=model, max_tokens=OUTLINE_MAX_TOKENS, messages=messages,
@@ -311,7 +325,7 @@ def outline(question: str, *, client: Any, region: str = "SG", history: Sequence
                 detail=bool(detail))
 
 
-def system_prompt(*, region: str, audience: str, today: str, detail: bool = False) -> str:
+def system_prompt(*, region: str, audience: str, today: str, detail: bool = False, medical: bool = False) -> str:
     reader = AUDIENCES.get(audience) or AUDIENCES[DEFAULT_AUDIENCE]
     return f"""You answer questions about medicines, pharmacology and chemistry inside a drug and chemical information app. People will only choose this app over a general chatbot if its answer is just as useful, takes less reading, and can be checked against its sources. Today is {today}. The reader's market is {_market(region)} {reader}
 
@@ -339,7 +353,7 @@ SHAPES: what was asked, and the most you may write ("points" across all sections
 - emergency: a possible overdose, poisoning or chemical exposure that has happened or is happening now. Headline starts with calling the emergency number. 3 points. 1 warning. A question about what would happen is explain.
 - evidence: what studies show (the evidence, research, trial results, guidelines or ongoing trials). Headline: the bottom line and how strong the evidence is (large randomised trials, small early trials, observational only, laboratory only). 6 points of at most 30 words: one per key study, starting with its name in bold as its snippet gives it (the trial's name, else first author and year), then its design in a few words, what it found with the figures from its abstract, and its main limit. Lead with the most cited and include the newest; never describe a study no snippet covers by its numbers. Then 1 point on what is unknown or under way: registered trials from ClinicalTrials.gov snippets, with phase, status and NCT number. When the question is whether trials exist or what is being tested, the headline gives the registry's count from its snippet, and the points name the latest-phase and largest registered trials, each with its NCT number, phase, status and size, before the published results. 1 warning.
 - calculate: a quantity worked out. Headline: the result in **bold** with its unit, rounded sensibly, and the formula in a few words. 3 points: the working, one step per point, with the numbers as the Calculator snippets give them; then what to watch for in practice. Every figure comes from a Calculator snippet you cite, or the question: call the calculate tool for any arithmetic no snippet has done, and never work a number out yourself. No warnings.
-- symptoms: the reader describes what they feel or what happened to their body and wants to know what it is or why. Whatever the reader setting above, write to the person who has the symptoms, as "you", in plain words, with any medical term explained in a few words. Headline: "Most likely **the condition**", a few plain words on what that is, and the detail of their story that points to it, never stated as a certain diagnosis. If it could be an emergency now, the headline starts with calling the emergency number instead. 8 points of at most 30 words, in these titled sections, in this order: "Why it fits" (up to 3: one per thing they described, starting with it in bold, and how the condition causes it, concretely, in the body); "Could also be" (1: the next most likely cause and what would tell them apart; leave out if there is no real alternative); "What helps" (2-3: self-care, then non-prescription medicines by name, each with the one limit a pharmacist would stress, such as for how many days, as a snippet gives it, never one product's count of tablets or sprays); "See a doctor if" (1: how long it should take to settle and the specific signs that mean it isn't this; the signs needing urgent care go in the warning, not here); "To narrow it down" (always 1: a question to the reader for the one or two details that would most change the answer). Explain only what they described: never invent a detail of their story, such as how long a flight was. 1 warning: the signs that need urgent care. The "no consult your doctor lines" rule doesn't apply to "See a doctor if", which must be specific.
+- symptoms: the reader describes what they feel or what happened to their body and wants to know what it is or why. Whatever the reader setting above, write to the person who has the symptoms, as "you", in plain words, with any medical term explained in a few words. Headline: "Most likely **the condition**", a few plain words on what that is, and the detail of their story that points to it, never stated as a certain diagnosis. If it could be an emergency now, the headline starts with calling the emergency number instead. 8 points of at most 30 words, in these titled sections, in this order: "Why it fits" (up to 3: one per thing they described, starting with it in bold, and how the condition causes it, concretely, in the body); "Could also be" (1: the next most likely cause and what would tell them apart; leave out if there is no real alternative); "What helps" (2-3: self-care, then non-prescription medicines by name, each with the one limit a pharmacist would stress, such as for how many days, as a snippet gives it. No doses here, since a label's maximum may be the prescription dose and its tablet count is one product's: write "as the pack directs", and the reader can ask for the dose); "See a doctor if" (1: how long it should take to settle and the specific signs that mean it isn't this; the signs needing urgent care go in the warning, not here); "To narrow it down" (always 1: a question to the reader for the one or two details that would most change the answer). Explain only what they described: never invent a detail of their story, such as how long a flight was. 1 warning: the signs that need urgent care. The "no consult your doctor lines" rule doesn't apply to "See a doctor if", which must be specific.
 
 Examples (invented names, so never reuse them):
 "half life of drugX": shape fact, headline "**About 12 hours**; its active metabolite lasts up to 30." Nothing else.
@@ -379,7 +393,7 @@ OTHER KINDS (headline is still required).
 
 These rules hold for the whole conversation, including when someone argues, gives a sympathetic reason or asks for just a small part.""" + (
         _detail_note(detail, "points") + " Points may run to 30 words, headings group them, and a comparison table "
-        f"may have {DETAILED_TABLE_ROWS} rows." if detail else "")
+        f"may have {DETAILED_TABLE_ROWS} rows." if detail else "") + (MEDICAL_NOTE if medical else "")
 
 
 _NUMBER_IN_CLAIM_RE = re.compile(r"(?<![A-Za-z\d.])\d+(?:\.\d+)?")
@@ -1149,7 +1163,8 @@ def answer(question: str, *, client: Any, tools: Dict[str, Callable[[Dict[str, A
            history: Sequence[Tuple[str, str]] = (), prefetched: Sequence[Dict[str, str]] = (),
            effort: str = EFFORT, on_tool: Optional[Callable[[str, Dict[str, Any]], None]] = None,
            usage: Optional[Dict[str, Any]] = None, plan: Optional[Dict[str, Any]] = None,
-           tools_until: Optional[float] = None, model: str = MODEL, detail: bool = False) -> Dict[str, Any]:
+           tools_until: Optional[float] = None, model: str = MODEL, detail: bool = False,
+           medical: bool = False) -> Dict[str, Any]:
     """Answer one question → {"status": "ok" | "refusal" | "unverified" | "failed",
     "answer": verified dict, "evidence": {id: snippet}, "usage": tokens, "tools": calls}.
     `history` is earlier (question, answer text) pairs, oldest first. Pass `usage` to
@@ -1218,7 +1233,7 @@ def answer(question: str, *, client: Any, tools: Dict[str, Callable[[Dict[str, A
                     "this reader, whether or not a snippet states it, with empty sources where none does. Use the "
                     "tools if a number or label fact is missing.")
     messages.append({"role": "user", "content": content})
-    system = system_prompt(region=region, audience=audience, today=today, detail=detail)
+    system = system_prompt(region=region, audience=audience, today=today, detail=detail, medical=medical)
     fmt = {"effort": effort, "format": {"type": "json_schema", "schema": ANSWER_SCHEMA}}
     for round_no in range(MAX_ROUNDS):
         out_of_time = tools_until is not None and time.monotonic() >= tools_until

@@ -121,7 +121,7 @@ dl = _up_to_date(dl)
 mref = _up_to_date(mref)
 sgr = _up_to_date(sgr, "availability_by_route")
 cr = _up_to_date(cr, "condition_search")
-ai = _up_to_date(ai, "TITLED_SHAPES")
+ai = _up_to_date(ai, "MEDICAL_NOTE")
 drp = _up_to_date(drp)
 
 # Optional Streamlit
@@ -4939,6 +4939,8 @@ def render_report_form(ctx: Dict[str, Any]):
 # ============================== Page sections ==============================
 _MODE_ASK, _MODE_EXPLORE, _MODE_LIBRARY = "💬 Ask", "🔎 Explore", "💊 Drug Library"
 _MODE_REFERENCE = "📘 Reference"
+_MODE_MEDICAL = "🩺 Medical assistant"
+_CHAT_MODES = (_MODE_ASK, _MODE_MEDICAL)
 
 
 def render_sidebar(mode: str) -> Dict[str, Any]:
@@ -4984,12 +4986,16 @@ def render_sidebar(mode: str) -> Dict[str, Any]:
                 st.session_state["_chat_ctx_cache"] = {}
                 st.toast("Cached data cleared — the next lookups fetch fresh data.")
         st.markdown("---")
-        if mode == _MODE_ASK:
+        if mode in _CHAT_MODES:
+            opts["medical"] = mode == _MODE_MEDICAL
             if _ai_ready():
-                opts["audience"] = st.radio(
-                    "Answer style", options=list(ai.AUDIENCES), key="ai_audience", horizontal=True,
-                    index=list(ai.AUDIENCES).index(ai.DEFAULT_AUDIENCE),
-                    help="How technical the answers are. The facts come from the same sources.")
+                if opts["medical"]:
+                    opts["audience"] = "Everyday"      # it speaks to the person who is unwell
+                else:
+                    opts["audience"] = st.radio(
+                        "Answer style", options=list(ai.AUDIENCES), key="ai_audience", horizontal=True,
+                        index=list(ai.AUDIENCES).index(ai.DEFAULT_AUDIENCE),
+                        help="How technical the answers are. The facts come from the same sources.")
                 opts["detail"] = st.radio(
                     "Answer length", options=["Standard", "Detailed"], key="ai_length", horizontal=True,
                     help="Detailed gives about twice as many points. You can also end any question with "
@@ -5002,7 +5008,7 @@ def render_sidebar(mode: str) -> Dict[str, Any]:
                                    mime="text/markdown", width='stretch', key="chat_save",
                                    help="Every question and answer with its sources and links, as a Markdown "
                                         "file you can keep with your notes.")
-            st.caption(_ABOUT_AI if _ai_ready() else
+            st.caption(_medical_disclaimer(opts) if opts["medical"] else _ABOUT_AI if _ai_ready() else
                        "Answers are matched from FDA labels, ChEMBL, PubChem, "
                        "Wikipedia and the HSA register — no AI model, nothing is "
                        "made up. Not medical advice.")
@@ -5231,7 +5237,42 @@ _SRC_CLASS = (("FDA", "fda"), ("PubChem", "pc"), ("Wikipedia", "wiki"), ("ChEMBL
 def _chat_ask(question: str):
     """Button callback: queue a question for the next run."""
     st.session_state["chat_pending"] = question
-    st.session_state["app_mode"] = _MODE_ASK
+    # A follow-up pressed in the medical assistant stays in that consultation
+    st.session_state["app_mode"] = _MODE_MEDICAL if st.session_state.get("chat_room") == "medical" else _MODE_ASK
+
+
+_CHAT_ROOM_KEYS = ("chat", "chat_context", "_chat_ctx_cache")
+
+
+def _chat_enter(room: str):
+    """Ask and the medical assistant are separate conversations over the same chat machinery:
+    going from one to the other puts this one's transcript away and brings the other's back."""
+    now = st.session_state.get("chat_room") or "ask"
+    if room == now:
+        return
+    st.session_state[f"_chat_room_{now}"] = {k: st.session_state.get(k) for k in _CHAT_ROOM_KEYS}
+    kept = st.session_state.get(f"_chat_room_{room}") or {}
+    st.session_state["chat"] = kept.get("chat") or []
+    st.session_state["chat_context"] = kept.get("chat_context") or {}
+    st.session_state["_chat_ctx_cache"] = kept.get("_chat_ctx_cache") or {}
+    st.session_state["chat_room"] = room
+
+
+def _medical_number(opts: Dict[str, Any]) -> str:
+    return "995" if opts.get("region") == "SG" else "911"
+
+
+def _medical_disclaimer(opts: Dict[str, Any]) -> str:
+    """Said under every reply in the medical assistant, whatever the answer was."""
+    return ("⚕️ **This is not medical advice.** I can't examine you or run tests, and I can be wrong. If you are "
+            "really ill, getting worse or worried, see a licensed medical practitioner. "
+            f"In an emergency call **{_medical_number(opts)}**.")
+
+
+_MEDICAL_EXAMPLES = ["I've had a sore throat and a fever for three days",
+                     "My lower back hurts since I lifted a heavy box yesterday",
+                     "I get a burning feeling in my chest after meals, worse lying down",
+                     "Itchy red rash on both arms since I started a new medicine"]
 
 
 def _chat_clear():
@@ -10932,7 +10973,8 @@ def _ai_outline_then_labels(text: str, client: Any, history, p: Dict[str, Any], 
     about and the labels of the medicines a list of them names, while the rest of the evidence
     comes in: its lines can then cite a source rather than rest on the model's memory."""
     plan = ai.outline(text, client=client, region=opts["region"], history=history, usage=opts["_ai_usage"],
-                      model=_ai_secret("AI_OUTLINE_MODEL", ai.OUTLINE_MODEL), detail=detail)
+                      model=_ai_secret("AI_OUTLINE_MODEL", ai.OUTLINE_MODEL), detail=detail,
+                      medical=bool(opts.get("medical")))
     if plan and subjects is not None and plan.get("lines"):
         ents, topics = _ai_parsed_drugs(p)
         subjects.want(plan, {key: set(topics) for e in ents for key in _ai_entity_keys(e)})
@@ -11012,7 +11054,7 @@ def _ai_history(opts: Dict[str, Any]) -> List[Tuple[str, str]]:
     msgs = list(st.session_state.get("chat") or [])
     if msgs and msgs[-1].get("role") == "user":
         msgs = msgs[:-1]
-    recent = msgs[-6:]
+    recent = msgs[-10:] if opts.get("medical") else msgs[-6:]     # a consultation builds on more of what was said
     pairs = []
     for q, a in zip(recent, recent[1:]):
         if q.get("role") == "user" and a.get("role") == "assistant":
@@ -11222,7 +11264,8 @@ def _ai_respond(text: str, opts: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     detail = bool(opts.get("detail") or ai.DETAIL_RE.search(text))
     opts["_ai_question"], opts["_ai_detail"] = text, detail
     history = _ai_history(opts)
-    key = (text.strip().lower(), opts["region"], audience, detail)
+    medical = bool(opts.get("medical"))
+    key = (text.strip().lower(), opts["region"], audience, detail, medical)
     if not history:
         hit = ai.cached_answer(key)
         if hit:
@@ -11284,7 +11327,7 @@ def _ai_respond(text: str, opts: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         res = ai.answer(text, client=client, tools=tools, region=opts["region"], audience=audience, today=today,
                         history=history, prefetched=prefetched, on_tool=on_tool, usage=opts["_ai_usage"], plan=plan,
                         tools_until=started + _AI_TOOLS_BUDGET_S, model=_ai_secret("AI_WRITER_MODEL", ai.MODEL),
-                        detail=detail)
+                        detail=detail, medical=medical)
     except Exception as e:  # noqa: BLE001 — any API trouble: the rule-based answer still works
         opts["_ai_note"] = "The AI answer isn't available just now, so this is the source text directly."
         if opts.get("debug_mode"):
@@ -11342,7 +11385,17 @@ def chat_respond(text: str, opts: Dict[str, Any]) -> Dict[str, Any]:
             blocks.append(_b("caption", v=f"{took} · {what} · not medical advice{_ai_cost_note(opts)}"))
         else:
             blocks.append(_b("caption", v=f"{took}{_ai_cost_note(opts)}"))
+        if opts.get("medical") and reply["kind"] != "crisis":     # the crisis reply has its own, better words
+            blocks.append(_b("caption", v=_medical_disclaimer(opts)))
         return {"role": "assistant", "blocks": blocks, "ai_text": reply["text"]}
+    if opts.get("medical") and cr.parse_query(text).get("mode") not in _AI_FIXED_MODES:
+        # The rule-based path only knows medicines by name: it can't assess a symptom, and mustn't seem to
+        why = opts.get("_ai_note") or ("The medical assistant needs the app's AI service, which isn't set up here."
+                                       if not _ai_ready() else "")
+        return {"role": "assistant", "blocks": [
+            _b("md", v="I can't assess symptoms right now. " + why.replace(", so this is the source text directly", "")
+                       + " Please try again in a moment, or use **💬 Ask** to look up a medicine by name."),
+            _b("caption", v=_medical_disclaimer(opts))]}
     parts = cr.split_question(text) if cr else [text]
     if len(parts) == 1:
         blocks, mode = _respond_one(text, opts)
@@ -11488,13 +11541,32 @@ def render_chat(opts: Dict[str, Any]):
     # called) so history knows whether a new answer is coming. No st.rerun():
     # the new answer renders in place, which keeps every widget in the page
     # tree current (a rerun left stale buttons whose callbacks could fire).
-    prompt = st.chat_input("Ask about a drug or chemical")
+    medical = bool(opts.get("medical"))
+    avatar = "🩺" if medical else "💊"
+    if medical:
+        st.info(_medical_disclaimer(opts))
+    prompt = st.chat_input("Describe what's wrong: what you feel, where, since when" if medical
+                           else "Ask about a drug or chemical")
     pending = st.session_state.pop("chat_pending", None)
     question = cr.clip_query(prompt or pending or "")
 
-    if not msgs and not question:
+    if medical and not msgs and not question:
+        with st.container(), st.chat_message("assistant", avatar=avatar):
+            st.markdown(
+                "Hello. Tell me what's troubling you, in your own words, as you would tell a GP. "
+                "I'll say what it most likely is and why, what else it could be, what you can do about it, "
+                "and when you should see a doctor. Then I'll ask a question or two to narrow it down.\n\n"
+                "It helps to mention **what** you feel and **where**, **how long** it has been going on, what makes "
+                "it **better or worse**, anything that happened just before (a flight, a new medicine, an injury), "
+                "and your **age**, regular **medicines** and other **conditions**.")
+            if _ai_ready():
+                render_blocks([_b("buttons", title="For example:", items=[(q, q) for q in _MEDICAL_EXAMPLES])], "welcome")
+            else:
+                st.warning("The medical assistant needs the app's AI service (an `ANTHROPIC_API_KEY` in the app's "
+                           "secrets), which isn't set up here.")
+    elif not msgs and not question:
         # In a container so the first question's message replaces it, rather than taking over its contents
-        with st.container(), st.chat_message("assistant", avatar="💊"):
+        with st.container(), st.chat_message("assistant", avatar=avatar):
             st.markdown("Hi! Ask me about a medicine or chemical — what it does, how it works, "
                         "side effects, dosing, interactions, structure or properties.")
             # With AI on, two of the six show what only this path does: the literature and the calculator
@@ -11514,7 +11586,7 @@ def render_chat(opts: Dict[str, Any]):
             with st.chat_message("user"):
                 st.markdown(_md_safe(m["text"]))
         else:
-            with st.chat_message("assistant", avatar="💊"):
+            with st.chat_message("assistant", avatar=avatar):
                 # Every element stays where it was: the app keeps the last run's elements on screen,
                 # greyed out, until this run ends, so with its buttons gone an answer's last lines
                 # would show twice while the next answer loads
@@ -11528,7 +11600,7 @@ def render_chat(opts: Dict[str, Any]):
     msgs.append({"role": "user", "text": question})
     with st.chat_message("user"):
         st.markdown(_md_safe(question))
-    with st.chat_message("assistant", avatar="💊"):
+    with st.chat_message("assistant", avatar=avatar):
         # a live status line ('Finding “phentermine”…', 'Reading the FDA label,
         # PubChem…') so a slow first lookup never looks frozen; gone once the
         # answer is there, whose caption keeps the time
@@ -11552,7 +11624,7 @@ def streamlit_app():
     st.session_state.setdefault("history", [])
     st.session_state.setdefault("chat", [])
 
-    modes = ([_MODE_ASK] if HAS_CHAT else []) + [_MODE_EXPLORE] + \
+    modes = ([_MODE_ASK, _MODE_MEDICAL] if HAS_CHAT else []) + [_MODE_EXPLORE] + \
         ([_MODE_LIBRARY] if HAS_DRUG_LIBRARY else []) + \
         ([_MODE_REFERENCE] if HAS_MAINSTREAM_REF else [])
     st.session_state.setdefault("app_mode", modes[0])
@@ -11560,6 +11632,8 @@ def streamlit_app():
         st.session_state["app_mode"] = modes[0]
     mode = st.radio("Mode", modes, key="app_mode", horizontal=True,
                     label_visibility="collapsed")
+    if mode in _CHAT_MODES:
+        _chat_enter("medical" if mode == _MODE_MEDICAL else "ask")
     if mode == _MODE_LIBRARY:
         render_drug_library()
         return
@@ -11567,7 +11641,7 @@ def streamlit_app():
         render_mainstream_reference()
         return
     opts = render_sidebar(mode)
-    if mode == _MODE_ASK:
+    if mode in _CHAT_MODES:
         if os.environ.get("CHEM_DEBUG_GLOBALS"):          # test harness hook only
             st.session_state["_dbg_globals"] = globals()
         if not st.session_state.get("_lexicon_warm"):

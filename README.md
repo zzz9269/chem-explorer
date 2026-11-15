@@ -56,6 +56,17 @@ those sources, never your own words. The reasoning from your symptoms to a
 condition is the AI's own and is marked † where no source states it: it is a
 probable cause to discuss with a doctor, not a diagnosis.
 
+**🩺 Medical assistant.** A page of its own, beside Ask, for a consultation: tell
+it what's troubling you as you would tell a GP, and it assesses the symptoms as
+above, recommends what to do (self-care, a non-prescription medicine, a
+pharmacist, a GP appointment, a same-day visit or an ambulance) and asks
+follow-up questions, reassessing with each reply. It keeps its own conversation,
+separate from Ask, takes your age, conditions and regular medicines into account
+when you mention them, and still answers a direct question about a medicine.
+The page, the sidebar and every reply say that this is not medical advice and to
+see a licensed medical practitioner if you are really ill. It needs the AI key:
+without one it says it can't assess symptoms rather than guess.
+
 **Answer length.** Standard answers are short. *Detailed* (sidebar), ending a
 question with *in detail*, or **➕ More detail** under an answer gives about twice
 as many points. **⬇️ Save conversation** in the sidebar downloads every question,

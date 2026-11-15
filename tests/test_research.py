@@ -396,3 +396,35 @@ def test_symptoms_shape_has_room_and_is_only_given_health_topics():
     assert ai.caps("symptoms")[0] >= 8 and ai.caps("symptoms", True)[0] > ai.caps("symptoms")[0]
     assert "symptoms" in ai.OUTLINE_SCHEMA["properties"]["shape"]["enum"]
     assert "health_topics" in ai.OUTLINE_SCHEMA["required"]
+
+
+# ---------------------------------------------------------------------------
+# Medical assistant mode
+# ---------------------------------------------------------------------------
+def test_medical_mode_changes_the_instructions_only_when_on():
+    plain = ai.system_prompt(region="SG", audience="Everyday", today="2026-11-15")
+    med = ai.system_prompt(region="SG", audience="Everyday", today="2026-11-15", medical=True)
+    assert "MEDICAL ASSISTANT MODE" in med and "MEDICAL ASSISTANT MODE" not in plain
+    assert "never a diagnosis" in ai.MEDICAL_NOTE
+
+
+def test_medical_assistant_page_without_a_key_says_so_and_always_carries_the_disclaimer():
+    import os
+    from streamlit.testing.v1 import AppTest
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    at = AppTest.from_file(os.path.join(root, "chem_v4.py"), default_timeout=120).run()
+    mode = next(m for m in at.radio(key="app_mode").options if "Medical assistant" in m)
+    ask = next(m for m in at.radio(key="app_mode").options if "Ask" in m)
+    at.radio(key="app_mode").set_value(mode).run()
+    assert not at.exception
+    assert any("not medical advice" in i.value and "licensed medical practitioner" in i.value for i in at.info)
+    at.chat_input[0].set_value("my head hurts when i bend down").run()
+    assert not at.exception
+    reply = at.session_state["chat"][-1]["blocks"]
+    assert "can't assess symptoms" in reply[0]["v"]
+    assert "licensed medical practitioner" in reply[-1]["v"]
+    # its own conversation: Ask starts empty, and coming back finds this one as it was left
+    at.radio(key="app_mode").set_value(ask).run()
+    assert at.session_state["chat"] == []
+    at.radio(key="app_mode").set_value(mode).run()
+    assert len(at.session_state["chat"]) == 2
