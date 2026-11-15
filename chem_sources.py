@@ -1935,3 +1935,79 @@ def chembl_potency(name: str = "", chembl_id: str = "", max_targets: int = 8) ->
     return {"chembl_id": cid, "name": shown, "ok": True, "measurements": len(acts),
             "url": f"https://www.ebi.ac.uk/chembl/compound_report_card/{cid}/",
             "targets": solid[:max(1, max_targets)]}
+
+
+# ---------------------------------------------------------------------------
+# MedlinePlus health topics (US National Library of Medicine). Free, no key.
+# Pages written for patients: what a condition is, self-care, when to get help.
+# ---------------------------------------------------------------------------
+MEDLINEPLUS_SEARCH = "https://wsearch.nlm.nih.gov/ws/query"
+_HEALTH_CREDIT_RE = re.compile(r"^(?:NIH|Centers for Disease Control|Food and Drug Administration|Dept\.|Department of)\b")
+
+
+def _health_sentences(summary: Any) -> List[str]:
+    """A topic's summary as sentences. Its bulleted lists become one sentence each
+    ('Common symptoms include: Pain; Hearing loss; Dizziness.'), since a bullet alone says nothing."""
+    import html as _html_mod
+    s = _html_mod.unescape(_html_mod.unescape(str(summary or "")))
+    s = re.sub(r"</li>\s*<li[^>]*>", "; ", s)
+    s = re.sub(r":?\s*(?:</p>)?\s*<ul[^>]*>\s*<li[^>]*>", ": ", s)
+    s = re.sub(r"\s*</li>\s*</ul>", ". ", s)
+    s = re.sub(r"</(?:p|h\d|div)>|<br\s*/?>", " ", s)
+    s = re.sub(r"\s+", " ", _TAG_RE.sub("", s)).strip()
+    s = re.sub(r"([.?!])\s*\.", r"\1", s)
+    out = []
+    for sent in re.split(r"(?<=[.!?])\s+(?=[A-Z])", s):
+        sent = sent.strip()
+        if len(sent) >= 25 and not _HEALTH_CREDIT_RE.match(sent):
+            out.append(sent)
+    return out
+
+
+def _health_query(term: str) -> Optional[Dict[str, Any]]:
+    """The best-matching topic for a term, {} when there is none, None when the service didn't answer."""
+    import xml.etree.ElementTree as ET
+    url = f"{MEDLINEPLUS_SEARCH}?db=healthTopics&retmax=1&term={_urlquote(term, safe='')}"
+    r = _get(url, timeout=8, breaker="medlineplus")
+    if r is None or r.status_code != 200:
+        return None
+    try:
+        doc = ET.fromstring(r.content).find(".//document")
+    except Exception:
+        return None
+    if doc is None:
+        return {}
+    fields: Dict[str, List[str]] = {}
+    for c in doc.findall("content"):
+        fields.setdefault(c.get("name") or "", []).append("".join(c.itertext()))
+    title = re.sub(r"\s+", " ", _TAG_RE.sub("", (fields.get("title") or [""])[0])).strip()
+    sentences = _health_sentences((fields.get("FullSummary") or [""])[0])
+    if not title or not sentences:
+        return {}
+    return {"title": title, "url": doc.get("url") or "", "sentences": sentences,
+            "also_called": [re.sub(r"\s+", " ", _TAG_RE.sub("", a)).strip() for a in fields.get("altTitle") or []]}
+
+
+def health_topic(term: str) -> Dict[str, Any]:
+    """MedlinePlus's page for a condition or symptom, in plain language.
+
+    `term` is a condition as such a page is titled ('Sinusitis', 'Barotrauma').
+    The site has a few hundred broad topics, so a subtype ('sinus barotrauma')
+    finds nothing: its last word is then tried, and then its first.
+
+    → {"title", "url", "sentences": [...], "also_called": [...], "asked", "ok"};
+    no "title" when there is no such topic; ok False when the service was down."""
+    term = re.sub(r"\s+", " ", str(term or "")).strip()
+    if not term:
+        return {"asked": term, "ok": True}
+    words = term.split()
+    tries = [term] + ([words[-1], words[0]] if len(words) > 1 else [])
+    for t in dict.fromkeys(tries):
+        if len(t) < 4:
+            continue
+        found = _health_query(t)
+        if found is None:
+            return {"asked": term, "ok": False}
+        if found:
+            return dict(found, asked=term, ok=True)
+    return {"asked": term, "ok": True}

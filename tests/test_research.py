@@ -328,3 +328,71 @@ def test_chembl_potency_puts_the_studied_targets_first():
     names = " ".join(t["target"] for t in res["targets"][:4])
     assert "ABL1" in names and "Kit" in names and all(t["n"] >= 2 and math.isfinite(t["median_nm"]) for t in res["targets"])
     assert cs.chembl_potency("zzzznotadrug") == {}
+
+
+# ---------------------------------------------------------------------------
+# Symptoms: 'what's wrong with me' answers, and MedlinePlus
+# ---------------------------------------------------------------------------
+def test_health_sentences_turn_a_list_into_one_sentence():
+    html = ("<p>Barotrauma means injury because of changes in air pressure. One common type happens to your ear.</p>"
+            "<p>Common symptoms of ear barotrauma include:</p><ul><li>Pain</li><li>Hearing loss</li><li>Dizziness</li></ul>"
+            "<p>Medications such as decongestants may also help.</p><p>NIH: National Institute of Something</p>")
+    got = cs._health_sentences(html)
+    assert "Common symptoms of ear barotrauma include: Pain; Hearing loss; Dizziness." in got
+    assert "Medications such as decongestants may also help." in got
+    assert not any(s.startswith("NIH") for s in got)
+    assert not any("<" in s for s in got)
+
+
+def test_health_topic_falls_back_to_the_broad_word(monkeypatch):
+    asked = []
+
+    def fake(term):
+        asked.append(term)
+        return {"title": "Barotrauma", "url": "u", "sentences": ["A sentence about it."], "also_called": []} \
+            if term == "barotrauma" else {}
+    monkeypatch.setattr(cs, "_health_query", fake)
+    got = cs.health_topic("sinus barotrauma")
+    assert asked == ["sinus barotrauma", "barotrauma"] and got["title"] == "Barotrauma" and got["ok"]
+    monkeypatch.setattr(cs, "_health_query", lambda term: None)
+    assert cs.health_topic("sinusitis")["ok"] is False
+    assert cs.health_topic("")["ok"] is True
+
+
+_SYMPTOM_PLAN = {"shape": "symptoms", "warning": "Stiff neck with fever, confusion or vision change needs emergency care.",
+                 "lines": ["Most likely sinus barotrauma after the flight.",
+                           "Pressure change on descent blocks sinus openings and traps air.",
+                           "Rest, steam and saline nasal rinses.",
+                           "See a doctor if it has not settled or there is high fever.",
+                           "How long ago did you land, and did your ears block on descent?"]}
+
+
+def _symptom_raw(safety):
+    return {"kind": "answer", "shape": "symptoms", "headline": "Most likely **sinus barotrauma** after the flight.",
+            "headline_sources": [], "safety": safety, "chain": [], "chain_sources": [], "table_columns": [],
+            "table_rows": [], "followups": [],
+            "sections": [{"title": "Why it fits", "points": [
+                {"text": "**Flight:** pressure change on descent blocks sinus openings and traps air.", "sources": [], "line": 2}]},
+                {"title": "What helps", "points": [
+                    {"text": "Rest, steam and saline nasal rinses.", "sources": [], "line": 3}]}]}
+
+
+def test_symptoms_keeps_its_headings_and_puts_missing_lines_under_their_own():
+    out = ai.verify(_symptom_raw([]), ai.Evidence("my head hurts after a flight"), _SYMPTOM_PLAN)
+    titles = [s["title"] for s in out["sections"]]
+    assert titles == ["Why it fits", "What helps", "See a doctor if", "To narrow it down"]
+    asked = out["sections"][-1]["points"][0]["text"]
+    assert asked.endswith("descent?") and not asked.endswith("?.")
+
+
+def test_symptoms_warning_is_the_urgent_signs_not_a_medicine_limit():
+    raw = _symptom_raw([{"level": "amber", "text": "Oxymetazoline spray causes rebound congestion with long use.", "sources": []}])
+    out = ai.verify(raw, ai.Evidence("my head hurts after a flight"), _SYMPTOM_PLAN)
+    assert len(out["safety"]) == 1
+    assert "Stiff neck" in out["safety"][0]["text"] and out["safety"][0]["level"] == "red"
+
+
+def test_symptoms_shape_has_room_and_is_only_given_health_topics():
+    assert ai.caps("symptoms")[0] >= 8 and ai.caps("symptoms", True)[0] > ai.caps("symptoms")[0]
+    assert "symptoms" in ai.OUTLINE_SCHEMA["properties"]["shape"]["enum"]
+    assert "health_topics" in ai.OUTLINE_SCHEMA["required"]

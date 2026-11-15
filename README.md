@@ -42,6 +42,20 @@ mg/kg for an 18 kg child*: the model writes the expression, the app evaluates it
 only state a figure the calculator produced. If the model put in a value the
 question didn't give, the working says so.
 
+**Symptoms.** Describe what you feel in your own words (*the back of my head
+hurts when I look down, and it got much worse after a flight*) and the answer
+names the most probable condition, explains why it causes each thing you
+described, gives the next most likely cause, what helps (self-care, then
+non-prescription medicines with the label's limits), when to see a doctor, and
+asks for the one or two details that would narrow it down; reply and it refines
+the answer. The signs that need urgent care are always shown in a red box, and a
+description that could be an emergency starts with calling 995. It reads
+MedlinePlus (US National Library of Medicine) and Wikipedia on the condition and
+the FDA labels of the medicines it names. Only the condition's name is sent to
+those sources, never your own words. The reasoning from your symptoms to a
+condition is the AI's own and is marked † where no source states it: it is a
+probable cause to discuss with a doctor, not a diagnosis.
+
 **Answer length.** Standard answers are short. *Detailed* (sidebar), ending a
 question with *in detail*, or **➕ More detail** under an answer gives about twice
 as many points. **⬇️ Save conversation** in the sidebar downloads every question,
@@ -168,6 +182,7 @@ don't run them in a tight loop.
 | Europe PMC (PubMed records) | papers: titles, abstracts, citation counts | abstracts © their publishers; metadata free to reuse |
 | ClinicalTrials.gov (NLM) | registered studies: phase, status, size, sponsor | public domain |
 | ChEMBL activities (EMBL-EBI) | potency at each target (IC50, Ki, Kd, EC50) | CC BY-SA 3.0 |
+| MedlinePlus health topics (NLM) | conditions in plain language: self-care, when to get medical help | NLM-written summaries are public domain; attribution requested |
 | Wikidata, UniChem, OPSIN, NCI CIR | identifiers, cross-references, name → structure | CC0 / open services |
 
 Refresh the bundled snapshots with `python build_hsa_register.py` and

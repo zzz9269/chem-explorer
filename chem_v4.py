@@ -115,13 +115,13 @@ def _up_to_date(module, newest: str = "__name__"):
     return module
 
 
-cs = _up_to_date(cs, "chembl_potency")
+cs = _up_to_date(cs, "health_topic")
 ci = _up_to_date(ci)
 dl = _up_to_date(dl)
 mref = _up_to_date(mref)
 sgr = _up_to_date(sgr, "availability_by_route")
 cr = _up_to_date(cr, "condition_search")
-ai = _up_to_date(ai, "calculation_snippets")
+ai = _up_to_date(ai, "TITLED_SHAPES")
 drp = _up_to_date(drp)
 
 # Optional Streamlit
@@ -792,7 +792,7 @@ if HAS_STREAMLIT:
     # Papers and registered trials change by the week, so these are kept for a day in memory
     # and never on disk; an outage's empty result isn't kept at all.
     _RESEARCH_FETCHERS = {"literature": cs.literature_search, "trials": cs.clinical_trials,
-                          "potency": cs.chembl_potency}
+                          "potency": cs.chembl_potency, "health": cs.health_topic}
 
     @st.cache_data(ttl=24 * 3600, max_entries=300, show_spinner=False)
     def _research_fetch(tag: str, *args):
@@ -818,6 +818,12 @@ if HAS_STREAMLIT:
             return _research_fetch("potency", name)
         except Exception:  # noqa: BLE001
             return {"targets": [], "ok": False}
+
+    def cached_health_topic(term: str) -> Dict[str, Any]:
+        try:
+            return _research_fetch("health", term)
+        except Exception:  # noqa: BLE001
+            return {"asked": term, "ok": False}
 
     def prefetch(*calls):
         """Run independent cached fetchers concurrently, so their results are
@@ -5177,6 +5183,7 @@ div[data-testid="stChatMessage"] li { margin-bottom: .3rem; line-height: 1.55; }
 .src-gtp { background: rgba(168,85,247,.18); } .src-calc { background: rgba(20,184,166,.18); }
 .src-atc { background: rgba(234,179,8,.18); }
 .src-lit { background: rgba(236,72,153,.16); } .src-trial { background: rgba(99,102,241,.18); }
+.src-nih { background: rgba(20,184,166,.18); }
 .chip { display: inline-block; padding: .18rem .7rem; margin: .15rem .35rem .2rem 0;
   border-radius: 999px; font-size: .85rem; background: rgba(128,128,128,.12);
   border: 1px solid rgba(128,128,128,.28); }
@@ -5217,7 +5224,8 @@ div[data-testid="stChatMessage"] li { margin-bottom: .3rem; line-height: 1.55; }
 _SRC_CLASS = (("FDA", "fda"), ("PubChem", "pc"), ("Wikipedia", "wiki"), ("ChEMBL", "chembl"),
               ("Guide to Pharmacology", "gtp"), ("RDKit", "calc"), ("inferred", "calc"),
               ("WHO ATC", "atc"), ("HSA", "atc"), ("Drug Library", "atc"), ("PubMed", "lit"),
-              ("ClinicalTrials", "trial"), ("Trial NCT", "trial"), ("Calculator", "calc"))
+              ("ClinicalTrials", "trial"), ("Trial NCT", "trial"), ("Calculator", "calc"),
+              ("MedlinePlus", "nih"))
 
 
 def _chat_ask(question: str):
@@ -5261,7 +5269,8 @@ def chat_markdown(msgs: List[Dict[str, Any]]) -> str:
                           for r in b["table_rows"]]
             for sec in b.get("sections") or []:
                 lines += ["", f"**{sec['title']}**"] if sec.get("title") else [""]
-                lines += [f"- {p['text']}{_md_cites(p['sources']) or ' †'}" for p in sec["points"]]
+                lines += [f"- {p['text']}{_md_cites(p['sources']) or ('' if p['text'].rstrip().endswith('?') else ' †')}"
+                          for p in sec["points"]]
             if b.get("market"):
                 lines += ["", "In Singapore (HSA register): " + " · ".join(f"{label}: {names}" for label, names in b["market"])]
             return lines + [""]
@@ -5470,7 +5479,8 @@ _AI_GENERAL_MARK = "<sup class='ai-general' title='General knowledge, not from a
 
 def _ai_claim_html(text: str, sources: List[Tuple[str, str]]) -> str:
     badges = "".join(_badge(s, u) for s, u in sources)
-    return _inline_html(text) + (badges or _AI_GENERAL_MARK)
+    # A question put to the reader ('How long ago did you land?') claims nothing, so needs no source
+    return _inline_html(text) + (badges or ("" if text.rstrip().endswith("?") else _AI_GENERAL_MARK))
 
 
 def _render_ai_answer(b: Dict[str, Any]):
@@ -10140,7 +10150,8 @@ def _help_blocks() -> List[Dict[str, Any]]:
 _ABOUT_AI = ("Answers are written by AI (Claude) from FDA labels, PubMed abstracts, ClinicalTrials.gov, "
              "ChEMBL, PubChem, Wikipedia and the HSA register, and each links its source. Sums are done by "
              "the app's calculator, not the AI. Your question is sent to Anthropic. Not medical advice.")
-_AI_RESEARCH_EXAMPLES = ["Latest evidence for semaglutide in heart failure?",
+_AI_RESEARCH_EXAMPLES = ["Why does my head hurt when I bend down since my flight?",
+                         "Latest evidence for semaglutide in heart failure?",
                          "How many grams of NaCl for 250 mL of 0.5 M?"]
 # 'More detail' on an answer asks its question again with this on the end
 _AI_DETAIL_SUFFIX = " (in detail)"
@@ -10579,6 +10590,21 @@ def _ai_encyclopedia_tool(inp: Dict[str, Any], opts: Dict[str, Any]) -> List[Dic
             if not (s in seen or seen.add(s))]
 
 
+def _ai_health_snippets(res: Dict[str, Any]) -> List[Dict[str, str]]:
+    """A MedlinePlus topic as evidence: one snippet a sentence, so a line cites what it says."""
+    if not res.get("title"):
+        return []
+    src = f"MedlinePlus: {res['title']}"
+    return [{"text": s, "src": src, "url": res.get("url", ""), "section": "Summary"}
+            for s in res.get("sentences") or []]
+
+
+def _ai_health_tool(inp: Dict[str, Any], opts: Dict[str, Any]) -> List[Dict[str, str]]:
+    """What the US National Library of Medicine's patient page says about a condition: only the
+    condition's name is sent, never the reader's own words."""
+    return _ai_health_snippets(cached_health_topic(str(inp.get("topic") or "").strip()))
+
+
 _AI_ABSTRACT_CHARS = 1150
 _AI_ABSTRACT_RESULTS_RE = re.compile(r"\b(?:RESULTS?|FINDINGS|Results?|Findings)\s*:\s*")
 _AI_ABSTRACT_END_RE = re.compile(r"\b(?:CONCLUSIONS?|INTERPRETATION|Conclusions?|Interpretation)\s*:\s*")
@@ -10794,7 +10820,7 @@ class _AiSubjectLoads:
 
     def __init__(self, opts: Dict[str, Any]):
         self.opts, self.compounds, self.articles, self.research = opts, [], [], []
-        self.ex = ThreadPoolExecutor(max_workers=2 * ai.MAX_COMPOUNDS + ai.MAX_ARTICLES + 2)
+        self.ex = ThreadPoolExecutor(max_workers=2 * ai.MAX_COMPOUNDS + ai.MAX_ARTICLES + ai.MAX_HEALTH_TOPICS + 2)
         self.lock = threading.Lock()
 
     def want(self, plan: Dict[str, Any], covered: Dict[str, set]):
@@ -10815,6 +10841,8 @@ class _AiSubjectLoads:
             for title in (plan.get("articles") or [])[:ai.MAX_ARTICLES]:
                 self.articles.append(submit_all(self.ex, (_ai_encyclopedia_tool, {
                     "subject": title, "_title": title, "keywords": list(dict.fromkeys(words))[:12]}, quiet))[0])
+            for topic in (plan.get("health_topics") or [])[:ai.MAX_HEALTH_TOPICS]:
+                self.articles.append(submit_all(self.ex, (_ai_health_tool, {"topic": topic}, quiet))[0])
             # `self.opts`, not the quiet copy: what these find is kept for the answer's reading list
             if plan.get("literature"):
                 self.research.append(submit_all(self.ex, (_ai_literature_tool, {"terms": plan["literature"]},
